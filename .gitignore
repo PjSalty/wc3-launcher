@@ -1,0 +1,7 @@
+# Build outputs: never commit binaries. They bloat history and embed local
+# build paths and symbols. CI builds release artifacts with -trimpath -ldflags '-s -w'.
+/dist/
+*.exe
+/wc3-relay
+/wc3-launcher
+/wc3-launcher.exe

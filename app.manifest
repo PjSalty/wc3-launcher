@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="WC3.PvPGN.Launcher" version="1.0.0.0"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <!-- requireAdministrator is REQUIRED, do not "fix" this to asInvoker.
+             It looks like unnecessary elevation (a security review flagged it as
+             exactly that), but it is not:
+               1. The W3L loader itself requires elevation, so a non-elevated
+                  parent cannot spawn it at all: CreateProcess fails outright with
+                  "The requested operation requires elevation" and the game never
+                  starts. Windows does not auto-elevate a child on exec.
+               2. The loader and maps are written into the Warcraft III install
+                  directory, which lives under Program Files.
+             Without this, every player has to right-click and Run as
+             administrator by hand, which is worse for them and no safer. Verified
+             the hard way: asInvoker shipped in v1.2.0 and broke launching. -->
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

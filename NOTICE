@@ -1,0 +1,44 @@
+Warcraft III PvPGN Launcher
+Third-party components
+
+This launcher is MIT-licensed (see LICENSE). It does not contain any Warcraft
+III game data: the game is downloaded at runtime from Blizzard Entertainment's
+own official free "legacy" installer (us.battle.net/download/getLegacy) and is
+never redistributed by this project.
+
+The launcher bundles the following third-party binaries, which it unpacks next
+to the game so Warcraft III can connect to a PvPGN server and render under Wine.
+Each remains under its own license, reproduced or pointed to below.
+
+================================================================================
+1. W3L loader: w3l.exe, w3lh.dll, wl27.dll
+   Purpose: patches Warcraft III's logon so it can connect to a PvPGN server
+            instead of Blizzard's Battle.net.
+   License: GNU General Public License (GPL).
+   Source:  The W3L loader is a PvPGN-community project. Corresponding source is
+            available from the PvPGN community distribution (cdn.pvpgn.pro / the
+            pvpgn project). For a copy of the corresponding source for the exact
+            build bundled here, open an issue on this repository and it will be
+            provided.
+
+            (The GPL requires a source offer that anyone receiving the binary
+            can actually act on, so this names a route that works for whoever
+            has the binary, not just people who know the author.)
+
+2. DXVK: d3d9.dll
+   Purpose: translates Direct3D 9 to Vulkan so the game renders reliably on
+            Linux/Wine (NVIDIA/Wayland).
+   License: zlib/libpng license.
+   Source:  https://github.com/doitsujin/dxvk
+   Copyright (c) 2017 Philip Rebohle and DXVK contributors.
+
+3. d3d8to9: d3d8.dll
+   Purpose: translates Warcraft III's Direct3D 8 calls to Direct3D 9 (fed into
+            DXVK above).
+   License: MIT License.
+   Source:  https://github.com/crosire/d3d8to9
+   Copyright (c) 2015 Patrick Mours.
+
+================================================================================
+Warcraft III and Battle.net are trademarks of Blizzard Entertainment, Inc. This
+project is not affiliated with or endorsed by Blizzard Entertainment.
