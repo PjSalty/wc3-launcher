@@ -55,11 +55,24 @@ func run() error {
 	// plain realm connection (join-only) and is only for debugging.
 	directMode := flag.Bool("direct", false, "connect straight to the realm instead of the host relay (join-only)")
 	showVersion := flag.Bool("version", false, "print launcher and Warcraft III versions and exit")
+	serverFlag := flag.String("server", "", "PvPGN + relay host to point at (also WC3_SERVER env, or wc3-launcher.json)")
+	tokenFlag := flag.String("token", "", "relay auth token (also WC3_RELAY_TOKEN env, or wc3-launcher.json)")
+	certPinFlag := flag.String("cert-pin", "", "base64 SHA-256 of the relay cert SPKI (also WC3_RELAY_CERT_PIN env, or wc3-launcher.json)")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(versionBanner())
 		return nil
+	}
+
+	// Runtime config: --flags / env / config file override the build-injected
+	// serverHost, relayToken, relayCertPin, so a stock binary can point at any
+	// server without a rebuild. Nothing set falls back to the compiled-in value.
+	resolveConnection(*serverFlag, *tokenFlag, *certPinFlag)
+	// Stock public build with nothing configured: prompt once and remember it.
+	maybeInteractiveSetup()
+	if !isConfigured() {
+		fmt.Println("No server is configured. Set one with --server, the WC3_SERVER env var, or a wc3-launcher.json file next to the binary (see the README). This build points at a placeholder and will not connect.")
 	}
 
 	fmt.Println("=== Warcraft III Launcher ===")

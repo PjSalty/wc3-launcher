@@ -51,16 +51,16 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Cross-compile launcher
-        env:
-          # These come from repo secrets/vars when the owner sets them, and are
-          # empty for a fork or a plain clone. The build must stay green either
-          # way, so every one of them is optional below.
-          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
-          RELAY_CERT_PIN: ${{ secrets.RELAY_CERT_PIN }}
-          SERVER_HOST: ${{ vars.SERVER_HOST }}
+      - name: Cross-compile launcher (generic, no secrets)
         run: |
           set -euo pipefail
+
+          # SECURITY: this public build is deliberately GENERIC. It never injects
+          # a server address, relay token, or cert pin, so a released binary can
+          # never carry anything private. The server is supplied at RUN time by
+          # the person who runs it (first-run prompt, --server / WC3_SERVER env,
+          # or a wc3-launcher.json). A baked-in build, if ever wanted, is done in
+          # a private pipeline, never in this public one.
 
           # Stamp the launcher's own version: the git tag on a tag build, else
           # the short SHA. main.launcherVersion drives the banner and --version.
@@ -71,31 +71,6 @@ jobs:
           fi
 
           LDFLAGS="-s -w -X main.launcherVersion=${VERSION}"
-
-          # The tunnel token and relay cert pin are injected from secrets so they
-          # never live in source. Unset is fine: no token means the launcher
-          # presents none, no pin means it falls back to system-root verification.
-          if [ -n "${RELAY_TOKEN:-}" ]; then
-            LDFLAGS="$LDFLAGS -X main.relayToken=${RELAY_TOKEN}"
-          else
-            echo "note: RELAY_TOKEN unset, launcher ships without a tunnel token"
-          fi
-          if [ -n "${RELAY_CERT_PIN:-}" ]; then
-            LDFLAGS="$LDFLAGS -X main.relayCertPin=${RELAY_CERT_PIN}"
-          else
-            echo "note: RELAY_CERT_PIN unset, launcher will not pin the relay cert"
-          fi
-
-          # serverHost is injected the same way, but here an unset value is NOT
-          # fatal. This is a public repo: anyone who clones or forks it must get
-          # a green build, and with SERVER_HOST unset the binary just defaults to
-          # the wc3.example.com placeholder baked into version.go. Failing the
-          # build on unset would break every fork and CI run that lacks the var.
-          if [ -n "${SERVER_HOST:-}" ]; then
-            LDFLAGS="$LDFLAGS -X main.serverHost=${SERVER_HOST}"
-          else
-            echo "note: SERVER_HOST unset, launcher defaults to the wc3.example.com placeholder"
-          fi
 
           mkdir -p dist
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \

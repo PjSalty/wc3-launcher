@@ -16,7 +16,9 @@ var launcherVersion = "dev"
 //
 // A build with the default cannot reach a real server: set it, or the launcher
 // tries to connect to the placeholder and fails. The release build injects it.
-var serverHost = "wc3.example.com"
+const placeholderHost = "wc3.example.com"
+
+var serverHost = placeholderHost
 
 // relayToken is the shared tunnel token presented to the relay. It is injected
 // at build time with -ldflags "-X main.relayToken=..." and is intentionally
