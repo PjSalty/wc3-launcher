@@ -11,7 +11,7 @@ variables:
   # Default Go image. `image:` does NOT support bash ${VAR:-default} expansion,
   # so the default lives here and a mirror overrides it with a project CI/CD
   # variable (e.g. a pull-through proxy). Nothing internal in the file.
-  CI_GO_IMAGE: golang:1.23-bookworm
+  CI_GO_IMAGE: golang:1.25-bookworm
 
 .go:
   image: "$CI_GO_IMAGE"
