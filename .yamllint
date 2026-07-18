@@ -1,0 +1,18 @@
+# YAML lint configuration for wc3-launcher.
+extends: relaxed
+
+rules:
+  line-length:
+    max: 200
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+  truthy:
+    allowed-values: ['true', 'false', 'yes', 'no']
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+
+ignore: |
+  .git/

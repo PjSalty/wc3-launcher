@@ -34,6 +34,13 @@ var relayToken = ""
 // ship in the binary. Empty falls back to standard system-root verification.
 var relayCertPin = ""
 
+// gatewayName is the realm's display name in WC3's gateway dropdown. It is a
+// cosmetic per-deployment label, injected at build time with
+// -ldflags "-X main.gatewayName=..." or set at runtime (--gateway, the
+// WC3_GATEWAY env, or wc3-launcher.json). It defaults to a generic name so no
+// realm brand ships in source.
+var gatewayName = "PvPGN"
+
 const (
 	// wc3ReignVersion and wc3FrozenVersion are the Warcraft III patch levels the
 	// launcher installs and the realm requires. Both classic products

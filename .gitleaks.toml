@@ -1,0 +1,7 @@
+# gitleaks config for wc3-launcher. Uses the upstream default ruleset as-is;
+# this repo ships no secrets (server address, token, and cert pin are injected at
+# build time or supplied at runtime, never committed), so no allowlist is needed.
+title = "wc3-launcher"
+
+[extend]
+useDefault = true

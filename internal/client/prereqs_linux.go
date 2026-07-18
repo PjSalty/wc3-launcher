@@ -17,10 +17,23 @@ import (
 // (via sudo). The dedicated Wine prefix means the user's own ~/.wine, packages,
 // and settings are never touched.
 func EnsurePrereqs() error {
-	if _, err := exec.LookPath("wine"); err == nil {
-		return nil // existing Wine found; leave it completely alone
+	if _, err := exec.LookPath("wine"); err != nil {
+		if err := installWine(); err != nil {
+			return err
+		}
 	}
+	// Wine is present (found or just installed). WC3 renders through DXVK, whose
+	// 32-bit d3d9.dll needs a 32-bit Vulkan loader that a fresh install usually
+	// lacks; without it the game crashes on startup (a flicker, then it closes).
+	// Offer to install it. Best-effort: warn and continue, never block a launch
+	// that would have worked, since the check is heuristic.
+	ensureVulkan()
+	return nil
+}
 
+// installWine detects the distro and installs Wine with the user's consent. The
+// dedicated Wine prefix means the user's own ~/.wine is never touched.
+func installWine() error {
 	d := detectDistro()
 	plan := d.wineInstall()
 
@@ -57,6 +70,65 @@ func EnsurePrereqs() error {
 	}
 	fmt.Println("Wine is installed. Continuing.")
 	return nil
+}
+
+// ensureVulkan checks for a 32-bit Vulkan loader and offers to install the
+// Vulkan runtime when it looks missing. Best-effort: it warns and returns rather
+// than failing, so it can never block a launch that would have worked.
+func ensureVulkan() {
+	if hasVulkan32() {
+		return
+	}
+	d := detectDistro()
+	plan := d.vulkanInstall()
+
+	fmt.Println()
+	fmt.Println("Warcraft III renders through DXVK (Vulkan), and a 32-bit Vulkan driver")
+	fmt.Println("does not look installed. Without it the game crashes on startup (a")
+	fmt.Println("flicker, then it closes).")
+
+	if plan.manual || len(plan.commands) == 0 {
+		if plan.note != "" {
+			fmt.Printf("Install it with:\n\n    %s\n\n", plan.note)
+		}
+		fmt.Println("Then run the launcher again. Continuing for now in case your setup is fine.")
+		return
+	}
+
+	fmt.Printf("I can install it on %s by running:\n\n    %s\n\n", d.pretty, plan.cmdline())
+	if plan.note != "" {
+		fmt.Printf("(%s)\n\n", plan.note)
+	}
+	if !promptYesNo("Install the 32-bit Vulkan driver now? (asks for your sudo password)") {
+		fmt.Println("Skipping. If the game crashes on launch, install it and retry.")
+		return
+	}
+	for _, c := range plan.commands {
+		fmt.Printf("+ %s\n", strings.Join(c, " "))
+		cmd := exec.Command(c[0], c[1:]...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("(Vulkan install step failed: %v. Continuing; install it by hand if the game crashes.)\n", err)
+			return
+		}
+	}
+	fmt.Println("Vulkan driver installed. Continuing.")
+}
+
+// hasVulkan32 heuristically reports whether a 32-bit Vulkan loader is present, by
+// looking for libvulkan.so.1 in the usual 32-bit library paths. Not exhaustive,
+// but it catches the common fresh-install gap where only the 64-bit loader (or
+// none) exists.
+func hasVulkan32() bool {
+	for _, p := range []string{
+		"/usr/lib/i386-linux-gnu/libvulkan.so.1", // debian / ubuntu multiarch
+		"/usr/lib32/libvulkan.so.1",              // arch and others
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // distro is the minimal identity we need from /etc/os-release.
@@ -185,6 +257,38 @@ func (d distro) wineInstall() installPlan {
 		}}
 	}
 	return installPlan{manual: true, note: "install the 'wine' package with your distro's package manager"}
+}
+
+// vulkanInstall is how we would install a 32-bit Vulkan loader + driver on this
+// distro. WC3 1.28 is a 32-bit app, so the 64-bit loader alone is not enough.
+func (d distro) vulkanInstall() installPlan {
+	if d.immutable {
+		return installPlan{manual: true, note: "install a 32-bit Vulkan driver via your image tooling (rpm-ostree/Flatpak runtime)"}
+	}
+	switch d.family() {
+	case "arch":
+		return installPlan{
+			commands: [][]string{{"sudo", "pacman", "-S", "--needed", "--noconfirm", "vulkan-icd-loader", "lib32-vulkan-icd-loader"}},
+			note:     "also install your GPU's 32-bit driver: lib32-mesa (AMD/Intel) or lib32-nvidia-utils (NVIDIA)",
+		}
+	case "debian":
+		return installPlan{
+			commands: [][]string{
+				{"sudo", "dpkg", "--add-architecture", "i386"},
+				{"sudo", "apt-get", "update"},
+				{"sudo", "apt-get", "install", "-y", "libvulkan1", "libvulkan1:i386", "mesa-vulkan-drivers", "mesa-vulkan-drivers:i386"},
+			},
+			note: "for NVIDIA also install the 32-bit NVIDIA Vulkan driver (libnvidia-gl-<ver>:i386)",
+		}
+	case "fedora", "rhel":
+		return installPlan{
+			commands: [][]string{{"sudo", "dnf", "install", "-y", "vulkan-loader.i686", "mesa-vulkan-drivers.i686"}},
+			note:     "for NVIDIA install the 32-bit NVIDIA Vulkan driver from RPM Fusion",
+		}
+	case "suse":
+		return installPlan{commands: [][]string{{"sudo", "zypper", "--non-interactive", "install", "libvulkan1-32bit", "Mesa-libGL1-32bit"}}}
+	}
+	return installPlan{manual: true, note: "install the 32-bit Vulkan loader (libvulkan1:i386 or lib32-vulkan-icd-loader) and your GPU's 32-bit Vulkan driver"}
 }
 
 func promptYesNo(q string) bool {

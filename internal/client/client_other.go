@@ -21,6 +21,9 @@ func Launch(dir, gameRoot, loaderExe string, classic bool) (*exec.Cmd, error) {
 // stays resident and never signals a false exit.
 func gameRunning() bool { return false }
 
+// ExistingGateway is unsupported here; nothing to migrate.
+func ExistingGateway(dir string) (host, name string, ok bool) { return "", "", false }
+
 // SetGamePort is unsupported outside Windows and Linux.
 func SetGamePort(dir string, port int) error {
 	return fmt.Errorf("this launcher supports Windows and Linux only")

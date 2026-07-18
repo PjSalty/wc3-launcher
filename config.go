@@ -12,9 +12,6 @@ import (
 // which is hardwired in the WC3 client and cannot be changed, and to relayPort
 // for the host tunnel. Both ports are forwarded to the server.
 const (
-	// gatewayName is shown in the WC3 gateway dropdown.
-	gatewayName = "PvPGN"
-
 	// gatewayTimezone is the server's UTC offset in hours. WC3 only uses it to
 	// sort the gateway list; -6 is US Central.
 	gatewayTimezone = "-6"

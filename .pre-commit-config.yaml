@@ -1,0 +1,30 @@
+---
+# Pre-commit hooks for wc3-launcher: standard hygiene plus Go formatting and vet.
+# The real gate is CI (gofmt, vet, test); this is fast local feedback.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-added-large-files
+        # The embedded loader/DXVK bundle is a few MB and lives in the repo.
+        args: [--maxkb=10240]
+      - id: check-yaml
+      - id: check-json
+      - id: detect-private-key
+
+  - repo: https://github.com/dnephin/pre-commit-golang
+    rev: v0.5.1
+    hooks:
+      - id: go-fmt
+      - id: go-vet-mod
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.2.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]

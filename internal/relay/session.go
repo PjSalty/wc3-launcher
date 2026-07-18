@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -174,7 +175,7 @@ func (s *Session) Run(ctx context.Context) error {
 	// working during rollout. This is a shared secret baked into the launcher, so
 	// it gates "must be running our launcher", not per-user identity - pvpgn's own
 	// account login remains the real play-access auth.
-	if s.token != "" && string(hello.Payload) != s.token {
+	if s.token != "" && subtle.ConstantTimeCompare(hello.Payload, []byte(s.token)) != 1 {
 		if s.requireAuth {
 			_ = s.send(tunnel.Frame{Type: tunnel.TypeError, Payload: []byte("unauthorized")})
 			return fmt.Errorf("tunnel from %s rejected: bad token", s.tun.RemoteAddr())
@@ -288,8 +289,12 @@ func (s *Session) openPvpgn(ctx context.Context, id uint16) {
 		return
 	}
 
+	// Bound each pvpgn dial so a hung backend stalls only this stream's open, not
+	// the session read loop that calls openPvpgn synchronously.
+	dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dcancel()
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", s.pvpgn)
+	conn, err := dialer.DialContext(dctx, "tcp", s.pvpgn)
 	if err != nil {
 		s.logf("stream %d: dial pvpgn %s failed: %v", id, s.pvpgn, err)
 		_ = s.send(tunnel.Frame{Type: tunnel.TypeClose, Stream: id})
