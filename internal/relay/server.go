@@ -112,6 +112,16 @@ func (srv *Server) ListenAndServe(ctx context.Context) error {
 			continue
 		}
 		go func(raw net.Conn, ip string) {
+			// A panic in one session must never take the whole internet-facing
+			// daemon down (and every other live game) with it. Contain it here so
+			// a single bad session dies alone. The slot is released first (LIFO),
+			// so a panic never leaks a session slot either.
+			defer func() {
+				if r := recover(); r != nil {
+					srv.logf("session from %s panicked, recovered: %v", raw.RemoteAddr(), r)
+					_ = raw.Close()
+				}
+			}()
 			defer srv.release(ip)
 			// ONE absolute pre-HELLO budget covering the TLS/plain peek, the TLS
 			// handshake, and the HELLO frame. Session.Run clears it once the session

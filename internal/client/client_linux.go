@@ -23,6 +23,10 @@ func wineEnv(dir string) []string {
 		// Vulkan. Wine's default D3D->OpenGL path fails to choose a pixel format
 		// on NVIDIA/Wayland and crashes the game on startup; DXVK is reliable.
 		"WINEDLLOVERRIDES=d3d8=n,d3d9=n",
+		// WINEDEBUG=-all silences Wine's own logs, but DXVK logs separately. Point
+		// it at the game folder so a startup crash (e.g. no 32-bit Vulkan driver)
+		// leaves a d3d9.log to diagnose instead of a silent flicker-and-exit.
+		"DXVK_LOG_PATH="+dir,
 	)
 }
 
@@ -43,6 +47,16 @@ func requireWine() (string, error) {
 		return "", fmt.Errorf("Wine is required to run Warcraft III on Linux; install it (for example `sudo apt install wine`, or via Lutris) and run the launcher again")
 	}
 	return path, nil
+}
+
+// ExistingGateway would migrate a player off an older baked-in launcher by
+// reading the realm it wrote into the Wine-prefix registry. Not implemented on
+// Linux yet (parsing `wine reg query` REG_MULTI_SZ output reliably needs a real
+// prefix to verify against), so a Linux upgrader is asked once and never again,
+// since the answer now persists to the per-user config dir. ok=false falls back
+// to setup.
+func ExistingGateway(dir string) (host, name string, ok bool) {
+	return "", "", false
 }
 
 // Configure writes the Battle.net gateway value into the game's Wine prefix and

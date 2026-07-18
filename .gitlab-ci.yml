@@ -1,0 +1,51 @@
+# Standalone CI for wc3-launcher: format, vet, test, and cross-compile both
+# binaries. Self-contained, no external includes. The Go image defaults to the
+# public one; a mirror can override it with a CI_GO_IMAGE variable (e.g. a
+# pull-through proxy), so nothing internal lives in this file.
+stages:
+  - validate
+  - build
+
+variables:
+  GOTOOLCHAIN: local # pin to the toolchain in go.mod, never auto-download
+  # Default Go image. `image:` does NOT support bash ${VAR:-default} expansion,
+  # so the default lives here and a mirror overrides it with a project CI/CD
+  # variable (e.g. a pull-through proxy). Nothing internal in the file.
+  CI_GO_IMAGE: golang:1.23-bookworm
+
+.go:
+  image: "$CI_GO_IMAGE"
+  before_script:
+    - go version
+
+go:checks:
+  extends: .go
+  stage: validate
+  script:
+    - test -z "$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
+    - go vet ./...
+    - go test ./...
+
+build:
+  extends: .go
+  stage: build
+  script:
+    # Generic build, no injected server address, token, or cert pin: a released
+    # binary carries nothing private, and the server is supplied at run time by
+    # whoever runs it (first-run prompt, --server / WC3_SERVER, or a config file).
+    - VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - LDFLAGS="-s -w -X main.launcherVersion=${VERSION}"
+    - GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o dist/wc3-launcher.exe .
+    - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o dist/wc3-launcher .
+    # Publish checksums so a download can be verified.
+    - (cd dist && sha256sum wc3-launcher.exe wc3-launcher | tee SHA256SUMS)
+    - ls -la dist/
+  artifacts:
+    paths:
+      - dist/wc3-launcher.exe
+      - dist/wc3-launcher
+      - dist/SHA256SUMS
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH

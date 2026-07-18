@@ -24,7 +24,7 @@ func TestResolveConnectionPrecedence(t *testing.T) {
 	// Flag beats env beats compiled-in default.
 	serverHost = "compiled-default"
 	t.Setenv("WC3_SERVER", "from-env")
-	resolveConnection("from-flag", "", "")
+	resolveConnection("from-flag", "", "", "")
 	if serverHost != "from-flag" {
 		t.Fatalf("serverHost = %q, want from-flag (flag wins)", serverHost)
 	}
@@ -32,14 +32,14 @@ func TestResolveConnectionPrecedence(t *testing.T) {
 	// Env beats the compiled-in default when no flag is given.
 	relayToken = "compiled-token"
 	t.Setenv("WC3_RELAY_TOKEN", "env-token")
-	resolveConnection("", "", "")
+	resolveConnection("", "", "", "")
 	if relayToken != "env-token" {
 		t.Fatalf("relayToken = %q, want env-token (env wins over default)", relayToken)
 	}
 
 	// Nothing set keeps the compiled-in default untouched.
 	relayCertPin = "compiled-pin"
-	resolveConnection("", "", "")
+	resolveConnection("", "", "", "")
 	if relayCertPin != "compiled-pin" {
 		t.Fatalf("relayCertPin = %q, want compiled-pin (default preserved)", relayCertPin)
 	}

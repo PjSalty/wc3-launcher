@@ -58,6 +58,7 @@ func run() error {
 	serverFlag := flag.String("server", "", "PvPGN + relay host to point at (also WC3_SERVER env, or wc3-launcher.json)")
 	tokenFlag := flag.String("token", "", "relay auth token (also WC3_RELAY_TOKEN env, or wc3-launcher.json)")
 	certPinFlag := flag.String("cert-pin", "", "base64 SHA-256 of the relay cert SPKI (also WC3_RELAY_CERT_PIN env, or wc3-launcher.json)")
+	gatewayFlag := flag.String("gateway", "", "realm display name in the WC3 gateway list (also WC3_GATEWAY env, or wc3-launcher.json)")
 	flag.Parse()
 
 	if *showVersion {
@@ -68,20 +69,34 @@ func run() error {
 	// Runtime config: --flags / env / config file override the build-injected
 	// serverHost, relayToken, relayCertPin, so a stock binary can point at any
 	// server without a rebuild. Nothing set falls back to the compiled-in value.
-	resolveConnection(*serverFlag, *tokenFlag, *certPinFlag)
-	// Stock public build with nothing configured: prompt once and remember it.
-	maybeInteractiveSetup()
+	resolveConnection(*serverFlag, *tokenFlag, *certPinFlag, *gatewayFlag)
+
+	// Resolve the game/prefix folder up front: migration reads the realm an older
+	// launcher wrote into the game's registry, so we need it before deciding
+	// whether to prompt.
+	dir, err := gameDir()
+	if err != nil {
+		return fmt.Errorf("locating game folder: %w", err)
+	}
+
+	// Nothing configured yet: first try to migrate a player upgrading from an
+	// older, baked-in launcher (adopt the realm it already wrote into the game's
+	// registry); otherwise run the one-time first-run prompt. Either way the
+	// answer persists to the config dir, so this happens only once, even after a
+	// later launcher download.
+	if !isConfigured() {
+		if host, name, ok := client.ExistingGateway(dir); ok {
+			adoptExistingGateway(host, name)
+		} else {
+			maybeInteractiveSetup()
+		}
+	}
 	if !isConfigured() {
 		fmt.Println("No server is configured. Set one with --server, the WC3_SERVER env var, or a wc3-launcher.json file next to the binary (see the README). This build points at a placeholder and will not connect.")
 	}
 
 	fmt.Println("=== Warcraft III Launcher ===")
 	fmt.Println(versionBanner())
-
-	dir, err := gameDir()
-	if err != nil {
-		return fmt.Errorf("locating game folder: %w", err)
-	}
 	fmt.Printf("Working folder: %s\n", dir)
 
 	// 0. On Linux, make sure Wine is available before we install or launch (no-op
@@ -261,7 +276,7 @@ func connectViaRelay(dir, gameRoot string) error {
 // public-CA trust for a server we control. Otherwise it verifies against the
 // system roots.
 func relayTLSConfig(host string) *tls.Config {
-	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS13}
 	if relayCertPin != "" {
 		cfg.InsecureSkipVerify = true // verified by pin below, not by CA chain
 		cfg.VerifyConnection = func(cs tls.ConnectionState) error {

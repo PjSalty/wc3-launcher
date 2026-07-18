@@ -6,6 +6,7 @@ package client
 
 import (
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -92,4 +93,21 @@ func gatewayStrings(host, timezone, name string) []string {
 		out = append(out, g[0], g[1], g[2])
 	}
 	return out
+}
+
+// parseGateway pulls the first realm's host and display name out of a "Battle.net
+// Gateways" REG_MULTI_SZ that a prior launcher wrote, whose layout is
+// ["1001", "<selected index>", host, zone, name, <default gateways>...]. It lets
+// an upgrading player be migrated off an older baked-in launcher without
+// re-entering their server. ok=false if it does not look like our value, or the
+// first host is a stock Blizzard gateway (nothing of ours to migrate).
+func parseGateway(vals []string) (host, name string, ok bool) {
+	if len(vals) < 5 || vals[0] != "1001" {
+		return "", "", false
+	}
+	host, name = strings.TrimSpace(vals[2]), strings.TrimSpace(vals[4])
+	if host == "" || strings.HasSuffix(strings.ToLower(host), "battle.net") {
+		return "", "", false
+	}
+	return host, name, true
 }

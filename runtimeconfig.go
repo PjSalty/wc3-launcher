@@ -18,6 +18,7 @@ type fileConfig struct {
 	Server  string `json:"server"`
 	Token   string `json:"token"`
 	CertPin string `json:"certPin"`
+	Gateway string `json:"gateway"`
 }
 
 // configPaths lists where loadFileConfig looks, in order: next to the binary
@@ -54,14 +55,22 @@ func loadFileConfig() fileConfig {
 	return fileConfig{}
 }
 
-// saveFileConfig writes cfg next to the binary and returns the path. Mode 0600
-// because the token, if present, is mildly sensitive.
+// saveFileConfig writes cfg to the per-user config dir and returns the path. It
+// deliberately does NOT write next to the binary: a stable per-user location
+// (%AppData%\wc3-launcher on Windows, ~/.config/wc3-launcher on Linux) means a
+// player can download a newer launcher into any folder and it picks the config
+// straight back up, so nobody re-enters their server after the first time. Mode
+// 0600 (dir 0700) because the token, if present, is mildly sensitive.
 func saveFileConfig(cfg fileConfig) (string, error) {
-	exe, err := os.Executable()
+	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(filepath.Dir(exe), "wc3-launcher.json")
+	dir := filepath.Join(base, "wc3-launcher")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "config.json")
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err
@@ -77,11 +86,12 @@ func saveFileConfig(cfg fileConfig) (string, error) {
 // env var, config file, then the compiled-in default. It runs once at startup,
 // before anything reads those package vars, so the rest of the code keeps
 // reading them exactly as before.
-func resolveConnection(serverFlag, tokenFlag, certPinFlag string) {
+func resolveConnection(serverFlag, tokenFlag, certPinFlag, gatewayFlag string) {
 	fc := loadFileConfig()
 	serverHost = firstNonEmpty(serverFlag, os.Getenv("WC3_SERVER"), fc.Server, serverHost)
 	relayToken = firstNonEmpty(tokenFlag, os.Getenv("WC3_RELAY_TOKEN"), fc.Token, relayToken)
 	relayCertPin = firstNonEmpty(certPinFlag, os.Getenv("WC3_RELAY_CERT_PIN"), fc.CertPin, relayCertPin)
+	gatewayName = firstNonEmpty(gatewayFlag, os.Getenv("WC3_GATEWAY"), fc.Gateway, gatewayName)
 }
 
 // isConfigured reports whether a real server has been set (i.e. this is not a
@@ -108,8 +118,9 @@ func maybeInteractiveSetup() {
 	}
 	token := ask(in, "  Relay token (leave blank if the server has none): ")
 	certPin := ask(in, "  Relay cert pin (leave blank for standard TLS verification): ")
+	gateway := ask(in, "  Realm name shown in-game (leave blank for the default): ")
 
-	cfg := fileConfig{Server: server, Token: token, CertPin: certPin}
+	cfg := fileConfig{Server: server, Token: token, CertPin: certPin, Gateway: gateway}
 	if path, err := saveFileConfig(cfg); err != nil {
 		fmt.Printf("  (could not save config, using these for this run only: %v)\n", err)
 	} else {
@@ -118,6 +129,28 @@ func maybeInteractiveSetup() {
 	serverHost = server
 	relayToken = firstNonEmpty(token, relayToken)
 	relayCertPin = firstNonEmpty(certPin, relayCertPin)
+	gatewayName = firstNonEmpty(gateway, gatewayName)
+}
+
+// adoptExistingGateway migrates a player upgrading from an older, baked-in
+// launcher: it takes the server and realm name that launcher already wrote into
+// the game's registry, asks only for a relay token if their server needs one,
+// and persists it, so the upgrade needs no full setup. The wire protocol is
+// unchanged, so the adopted server keeps working with an already-deployed relay.
+func adoptExistingGateway(host, name string) {
+	serverHost = host
+	if name != "" {
+		gatewayName = name
+	}
+	fmt.Printf("\nFound your existing server (%s). Migrating it so you don't set it up again.\n", host)
+	if stdinIsTerminal() {
+		token := ask(bufio.NewReader(os.Stdin), "  Relay token, if your server needs one (blank if not): ")
+		relayToken = firstNonEmpty(token, relayToken)
+	}
+	cfg := fileConfig{Server: serverHost, Token: relayToken, CertPin: relayCertPin, Gateway: gatewayName}
+	if path, err := saveFileConfig(cfg); err == nil {
+		fmt.Printf("  Saved to %s. You won't be asked again.\n", path)
+	}
 }
 
 // ask prints a label and reads one trimmed line, accepting empty input (so

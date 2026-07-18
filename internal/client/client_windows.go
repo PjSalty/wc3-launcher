@@ -31,6 +31,24 @@ func Configure(dir, host, name, timezone string) error {
 	return nil
 }
 
+// ExistingGateway returns the realm host and display name a prior launcher wrote
+// into the WC3 registry, so an upgrading player is migrated without re-entering
+// them. Best-effort: ok=false on any miss, so the caller falls back to setup.
+// dir is unused on Windows (the registry is per-user global).
+func ExistingGateway(dir string) (host, name string, ok bool) {
+	const keyPath = `Software\Blizzard Entertainment\Warcraft III`
+	key, err := registry.OpenKey(registry.CURRENT_USER, keyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return "", "", false
+	}
+	defer key.Close()
+	vals, _, err := key.GetStringsValue(gatewayValueName)
+	if err != nil {
+		return "", "", false
+	}
+	return parseGateway(vals)
+}
+
 // SetGamePort writes WC3's host game port (netgameport) so its game listener
 // moves off 6112, freeing that port for the launcher's local BnetGateway in
 // relay-host mode. dir is unused on Windows.
