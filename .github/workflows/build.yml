@@ -31,6 +31,11 @@ jobs:
       - name: go test
         run: go test ./...
       - name: govulncheck (dependency + stdlib CVEs)
+        env:
+          # govulncheck's own build needs a newer toolchain than the pinned one,
+          # so let it fetch that for the tool. The launcher build steps keep
+          # GOTOOLCHAIN=local, so the shipped binary's toolchain stays pinned.
+          GOTOOLCHAIN: auto
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
