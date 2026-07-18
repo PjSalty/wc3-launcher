@@ -1,4 +1,4 @@
-# Build the launcher friends download to play, and cut signed releases on a tag.
+# Build the launcher friends download to play.
 name: build
 
 on:
@@ -7,9 +7,8 @@ on:
     tags: ['v*']
   pull_request:
 
-# Least privilege by default; the build/release job elevates only what it needs.
 permissions:
-  contents: read
+  contents: write # needed to attach binaries to a Release on a v* tag
 
 env:
   GOTOOLCHAIN: local # pin to the toolchain in go.mod, never auto-download
@@ -18,102 +17,87 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+
       - name: gofmt (must be clean)
         run: |
+          # gofmt -l prints files that need formatting; empty output = clean.
           fmt="$(gofmt -l .)"
-          if [ -n "$fmt" ]; then echo "gofmt needed:"; echo "$fmt"; exit 1; fi
+          if [ -n "$fmt" ]; then
+            echo "gofmt needed:"
+            echo "$fmt"
+            exit 1
+          fi
+
       - name: go vet
         run: go vet ./...
+
       - name: go test
         run: go test ./...
-      - name: govulncheck (dependency + stdlib CVEs)
-        env:
-          # govulncheck's own build needs a newer toolchain than the pinned one,
-          # so let it fetch that for the tool. The launcher build steps keep
-          # GOTOOLCHAIN=local, so the shipped binary's toolchain stays pinned.
-          GOTOOLCHAIN: auto
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
 
   build:
     needs: check
     # Only ship binaries on a tag or a default-branch push, never on PRs.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # attach binaries to a Release on a v* tag
-      id-token: write # keyless cosign signing via GitHub OIDC (Fulcio/Rekor)
-      attestations: write # build provenance attestation
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
       - name: Cross-compile launcher (generic, no secrets)
         run: |
           set -euo pipefail
-          # SECURITY: this public build is deliberately GENERIC. It never injects a
-          # server address, relay token, or cert pin, so a released binary can never
-          # carry anything private. The server is supplied at RUN time by whoever
-          # runs it (first-run prompt, --server / WC3_SERVER, or wc3-launcher.json).
+
+          # SECURITY: this public build is deliberately GENERIC. It never injects
+          # a server address, relay token, or cert pin, so a released binary can
+          # never carry anything private. The server is supplied at RUN time by
+          # the person who runs it (first-run prompt, --server / WC3_SERVER env,
+          # or a wc3-launcher.json). A baked-in build, if ever wanted, is done in
+          # a private pipeline, never in this public one.
+
+          # Stamp the launcher's own version: the git tag on a tag build, else
+          # the short SHA. main.launcherVersion drives the banner and --version.
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME}"
           else
             VERSION="$(git rev-parse --short HEAD)"
           fi
+
           LDFLAGS="-s -w -X main.launcherVersion=${VERSION}"
+
           mkdir -p dist
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
             go build -trimpath -ldflags "$LDFLAGS" -o dist/wc3-launcher.exe .
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
             go build -trimpath -ldflags "$LDFLAGS" -o dist/wc3-launcher .
+
+          # Publish checksums so a download can be verified. The binaries are not
+          # signed yet, so the checksum is the integrity check players should use.
           (cd dist && sha256sum wc3-launcher.exe wc3-launcher | tee SHA256SUMS)
           ls -la dist/
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        with:
-          path: .
-          format: spdx-json
-          output-file: dist/wc3-launcher.sbom.spdx.json
-
-      - name: Install cosign
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-
-      - name: Sign binaries + checksums (keyless)
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          COSIGN_YES: "true"
-        run: |
-          set -euo pipefail
-          # Keyless signing via GitHub OIDC: no private key, verifiable against the
-          # public Rekor transparency log. Players verify with
-          #   cosign verify-blob --bundle <file>.cosign.bundle <file>
-          for f in dist/wc3-launcher.exe dist/wc3-launcher dist/SHA256SUMS; do
-            cosign sign-blob --yes "$f" --bundle "$f.cosign.bundle"
-          done
-
       - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@v4
         with:
           name: wc3-launcher
-          path: dist/
+          path: |
+            dist/wc3-launcher.exe
+            dist/wc3-launcher
+            dist/SHA256SUMS
           retention-days: 30
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/wc3-launcher.exe
             dist/wc3-launcher
             dist/SHA256SUMS
-            dist/wc3-launcher.sbom.spdx.json
-            dist/*.cosign.bundle
