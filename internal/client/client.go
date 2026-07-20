@@ -22,17 +22,24 @@ var gameProcessNames = []string{"war3.exe", "warcraft iii.exe", "frozen throne.e
 // grace window, it blocks forever so the launcher stays resident and keeps
 // carrying the relay rather than closing early.
 func WaitForGameExit(started *exec.Cmd) {
-	// Reap the loader/desktop process in the background so it never lingers as a
-	// zombie, but do NOT block on it: on Windows the loader exits instantly and on
-	// Linux the Wine desktop process may live for the whole game, so neither is a
-	// reliable "game closed" signal. Poll for the real game process instead.
+	// Reap the launched process and turn its exit into a signal. Whether that exit
+	// means "game over" depends on the platform (decided after the game appears,
+	// below): on Linux the `wine explorer /desktop` window lives for the whole
+	// game, so its exit is authoritative; on Windows and Linux raw-fullscreen the
+	// loader exits immediately after spawning the game, so it is not. Either way,
+	// the launcher must never block forever holding the local gateway port, which
+	// is what used to leave a stale copy squatting on it and blocking the next run.
+	loaderDone := make(chan struct{})
 	if started != nil {
-		go func() { _ = started.Wait() }()
+		go func() { _ = started.Wait(); close(loaderDone) }()
+	} else {
+		close(loaderDone)
 	}
 	// Phase 1: wait for the game to appear. A first launch (with patching) can be
-	// slow, so allow several minutes; until then the launcher stays resident.
+	// slow, so allow several minutes. If it never shows within the window, RETURN
+	// instead of blocking forever, so the launcher always releases the port.
 	appeared := false
-	for i := 0; i < 150; i++ { // ~5 minutes at 2s
+	for i := 0; i < 180 && !appeared; i++ { // up to ~6 minutes at 2s
 		if gameRunning() {
 			appeared = true
 			break
@@ -40,13 +47,38 @@ func WaitForGameExit(started *exec.Cmd) {
 		time.Sleep(2 * time.Second)
 	}
 	if !appeared {
-		select {} // never detected the game; never signal exit
+		return // never detected the game; do not linger and hold the gateway port
 	}
-	// Phase 2: wait for it to close. Two consecutive misses guard against a
-	// transient enumeration glitch flapping the launcher shut mid-game.
+	// Decide whether `started` tracks the game's lifetime. The Linux
+	// `wine explorer /desktop` window lives for the whole game, so it is still
+	// running now; the Windows loader and Linux raw-fullscreen loader exit right
+	// after spawning the game, so loaderDone has already fired. Give an
+	// instant-exit loader a moment to finish, then trust loaderDone as a game-over
+	// signal ONLY when it is still open - otherwise a Windows launch would see the
+	// loader already gone and shut down mid-game, tearing down the relay.
+	time.Sleep(2 * time.Second)
+	tracksGame := false
+	select {
+	case <-loaderDone:
+	default:
+		tracksGame = true
+	}
+	// Phase 2: return when the game closes. When the launched process tracks the
+	// game (Linux virtual desktop), also return the moment it exits - that fires
+	// even if the game was never matched by name or a stray process lingers, which
+	// is what used to hang the launcher. On Windows/raw-fullscreen the loader is
+	// gone, so fall back to polling the game process only.
 	misses := 0
 	for {
-		time.Sleep(2 * time.Second)
+		if tracksGame {
+			select {
+			case <-loaderDone:
+				return
+			case <-time.After(2 * time.Second):
+			}
+		} else {
+			time.Sleep(2 * time.Second)
+		}
 		if gameRunning() {
 			misses = 0
 			continue

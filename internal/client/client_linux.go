@@ -49,14 +49,37 @@ func requireWine() (string, error) {
 	return path, nil
 }
 
-// ExistingGateway would migrate a player off an older baked-in launcher by
-// reading the realm it wrote into the Wine-prefix registry. Not implemented on
-// Linux yet (parsing `wine reg query` REG_MULTI_SZ output reliably needs a real
-// prefix to verify against), so a Linux upgrader is asked once and never again,
-// since the answer now persists to the per-user config dir. ok=false falls back
-// to setup.
+// ExistingGateway migrates a player off an older baked-in launcher by reading
+// the realm it wrote into the game's Wine-prefix registry, so an upgrader is not
+// asked to set it up again. Best-effort: ok=false on any miss (no Wine, no
+// prefix, no value), so the caller falls back to the first-run prompt.
 func ExistingGateway(dir string) (host, name string, ok bool) {
-	return "", "", false
+	wine, err := exec.LookPath("wine")
+	if err != nil {
+		return "", "", false
+	}
+	cmd := exec.Command(wine, "reg", "query", gatewayRegKey, "/v", gatewayValueName)
+	cmd.Env = wineEnv(dir)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", "", false
+	}
+	return parseWineGateway(string(out))
+}
+
+// parseWineGateway pulls the gateway host + name out of `wine reg query` output,
+// whose value line reads: "<name>\tREG_MULTI_SZ\t1001\0<idx>\0host\0zone\0name\0
+// ...", with each REG_MULTI_SZ entry rendered with a literal two-character `\0`
+// separator. Splitting on that literal yields the positional list parseGateway
+// expects.
+func parseWineGateway(out string) (host, name string, ok bool) {
+	const marker = "REG_MULTI_SZ"
+	i := strings.Index(out, marker)
+	if i < 0 {
+		return "", "", false
+	}
+	data := strings.TrimSpace(out[i+len(marker):])
+	return parseGateway(strings.Split(data, `\0`))
 }
 
 // Configure writes the Battle.net gateway value into the game's Wine prefix and
@@ -107,13 +130,25 @@ func SetGamePort(dir string, port int) error {
 	return nil
 }
 
-// primaryResolution returns the current display resolution (e.g. "1920x1080")
-// for the Wine virtual desktop, falling back to 1920x1080 when it can't be read
-// (headless, no xrandr, etc.).
+// primaryResolution returns the resolution of the PRIMARY display (e.g.
+// "1920x1080") for the Wine virtual desktop. On a multi-monitor setup it must be
+// the main screen, not whichever output xrandr happens to list first (which is
+// often a side/portrait monitor), so it reads the geometry of the output marked
+// `primary` - the "WxH" of its "WxH+X+Y", which already reflects any rotation.
+// Falls back to the first current mode, then 1920x1080 (headless, no xrandr).
 func primaryResolution() string {
-	out, err := exec.Command("sh", "-c", `xrandr --current 2>/dev/null | awk '/\*/{print $1; exit}'`).Output()
-	if res := strings.TrimSpace(string(out)); err == nil && res != "" {
-		return res
+	// Primary output's displayed geometry: `... connected primary 3840x2160+2160+854 ...`
+	if out, err := exec.Command("sh", "-c",
+		`xrandr --current 2>/dev/null | awk '/ connected primary / {for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+x[0-9]+\+/) {split($i,a,"+"); print a[1]; exit}}'`).Output(); err == nil {
+		if res := strings.TrimSpace(string(out)); res != "" {
+			return res
+		}
+	}
+	// No primary flagged: fall back to the first current (*) mode.
+	if out, err := exec.Command("sh", "-c", `xrandr --current 2>/dev/null | awk '/\*/{print $1; exit}'`).Output(); err == nil {
+		if res := strings.TrimSpace(string(out)); res != "" {
+			return res
+		}
 	}
 	return "1920x1080"
 }

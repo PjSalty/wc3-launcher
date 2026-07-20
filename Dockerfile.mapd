@@ -1,0 +1,31 @@
+# Dockerfile.mapd
+#
+# Builds wc3-mapd (cmd/wc3-mapd): the read-only map library server the wc3-server
+# compose stack runs. It serves a curated maps directory over HTTP(S) so players'
+# launchers sync the same set of maps. The build context is this repo (the
+# wc3-launcher repo), the same repo the relay is built from.
+#
+#   docker build -f Dockerfile.mapd -t localhost/wc3/wc3-mapd:latest .
+#
+# Runtime: mount your curated maps read-only at /maps and (recommended) a TLS
+# cert+key at /tls, then run with -cert=/tls/fullchain.pem -key=/tls/privkey.pem.
+# There is no upload path: the container only ever reads /maps.
+
+FROM golang:1.25-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# Static, stripped binary so it runs on a distroless base. CGO off, toolchain
+# pinned for a reproducible build.
+RUN CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags "-s -w" \
+    -o /out/wc3-mapd ./cmd/wc3-mapd
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/wc3-mapd /usr/local/bin/wc3-mapd
+# Serves 7443. Runs as the distroless nonroot user, so the mounted /maps and
+# /tls files must be readable by that user (uid 65532).
+EXPOSE 7443
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/wc3-mapd"]
+CMD ["-dir=/maps", "-addr=:7443"]

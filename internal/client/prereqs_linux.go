@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -28,6 +29,11 @@ func EnsurePrereqs() error {
 	// Offer to install it. Best-effort: warn and continue, never block a launch
 	// that would have worked, since the check is heuristic.
 	ensureVulkan()
+	// WC3 plays its intro cinematics (AVI) through Wine's GStreamer bridge. On a
+	// fresh install the codec plugins (gst-libav + the avi demuxer) are usually
+	// missing, winegstreamer fails to decode the stream, and the game crashes
+	// right after the DXVK device comes up. Offer to install them. Best-effort.
+	ensureGstreamer()
 	return nil
 }
 
@@ -129,6 +135,88 @@ func hasVulkan32() bool {
 		}
 	}
 	return false
+}
+
+// ensureGstreamer checks for the GStreamer codec plugins Wine needs to play WC3's
+// intro videos (AVI) and offers to install them when they look missing. Best-
+// effort: it warns and returns rather than failing, so it can never block a
+// launch that would have worked.
+func ensureGstreamer() {
+	d := detectDistro()
+	if d.hasGstreamerCodecs() {
+		return
+	}
+	plan := d.gstreamerInstall()
+
+	fmt.Println()
+	fmt.Println("Warcraft III plays its intro videos through GStreamer, and the codec")
+	fmt.Println("plugins for them (gst-libav and the AVI demuxer) do not look installed.")
+	fmt.Println("Without them the game crashes right after it opens (the window appears,")
+	fmt.Println("then closes with a video decode error).")
+
+	if plan.manual || len(plan.commands) == 0 {
+		if plan.note != "" {
+			fmt.Printf("Install them with:\n\n    %s\n\n", plan.note)
+		}
+		fmt.Println("Then run the launcher again. Continuing for now in case your setup is fine.")
+		return
+	}
+
+	fmt.Printf("I can install them on %s by running:\n\n    %s\n\n", d.pretty, plan.cmdline())
+	if plan.note != "" {
+		fmt.Printf("(%s)\n\n", plan.note)
+	}
+	if !promptYesNo("Install the GStreamer codecs now? (asks for your sudo password)") {
+		fmt.Println("Skipping. If the game crashes on launch, install them and retry.")
+		return
+	}
+	for _, c := range plan.commands {
+		fmt.Printf("+ %s\n", strings.Join(c, " "))
+		cmd := exec.Command(c[0], c[1:]...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("(GStreamer codec install step failed: %v. Continuing; install by hand if the game crashes.)\n", err)
+			return
+		}
+	}
+	fmt.Println("GStreamer codecs installed. Continuing.")
+}
+
+// hasGstreamerCodecs reports whether the libav codec plugin is present in the
+// GStreamer plugin dir that THIS distro's Wine actually loads for a 32-bit game.
+// WC3 (1.28.x) is 32-bit: on the multilib-Wine distros (Debian/Fedora/SUSE) it
+// loads the 32-bit host GStreamer, so the 32-bit plugin dir is what matters and a
+// 64-bit-only libgstlibav.so does NOT count (a 32-bit process cannot load it).
+// Arch is pure WoW64, where a 32-bit app uses the 64-bit host plugins, so there
+// the 64-bit dir is the right one. Checking the wrong-bitness dir was why the
+// v1.3.1 check falsely passed on multilib boxes and skipped the real fix.
+func (d distro) hasGstreamerCodecs() bool {
+	for _, dir := range d.gstreamerPluginDirs() {
+		if _, err := os.Stat(filepath.Join(dir, "libgstlibav.so")); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// gstreamerPluginDirs returns the plugin dir(s) that hold the codec Wine needs on
+// this distro: the 32-bit multilib path on Debian/Fedora/SUSE, and the plain
+// 64-bit path on Arch (WoW64). Unknown distros check the common 32-bit spots so we
+// prompt rather than falsely skip.
+func (d distro) gstreamerPluginDirs() []string {
+	switch d.family() {
+	case "debian":
+		return []string{"/usr/lib/i386-linux-gnu/gstreamer-1.0"} // i386 multiarch
+	case "fedora", "rhel", "suse":
+		return []string{"/usr/lib/gstreamer-1.0"} // 32-bit multilib dir (/usr/lib64 is 64-bit)
+	case "arch":
+		return []string{"/usr/lib/gstreamer-1.0"} // WoW64: 64-bit host plugins
+	}
+	return []string{
+		"/usr/lib/i386-linux-gnu/gstreamer-1.0",
+		"/usr/lib32/gstreamer-1.0",
+		"/usr/lib/gstreamer-1.0",
+	}
 }
 
 // distro is the minimal identity we need from /etc/os-release.
@@ -289,6 +377,50 @@ func (d distro) vulkanInstall() installPlan {
 		return installPlan{commands: [][]string{{"sudo", "zypper", "--non-interactive", "install", "libvulkan1-32bit", "Mesa-libGL1-32bit"}}}
 	}
 	return installPlan{manual: true, note: "install the 32-bit Vulkan loader (libvulkan1:i386 or lib32-vulkan-icd-loader) and your GPU's 32-bit Vulkan driver"}
+}
+
+// gstreamerInstall is how we would install the GStreamer codec plugins WC3's
+// intro cinematics need through Wine: the AVI demuxer (plugins-good) plus the
+// libav/ffmpeg video decoders (gst-libav).
+func (d distro) gstreamerInstall() installPlan {
+	if d.immutable {
+		return installPlan{manual: true, note: "install the GStreamer codec plugins (gst-libav + plugins-good/bad/ugly, including the 32-bit variants for Wine) via your image tooling or a Flatpak runtime"}
+	}
+	switch d.family() {
+	case "arch":
+		// Arch is pure WoW64: a 32-bit app uses the 64-bit host GStreamer, so the
+		// 64-bit plugins are the ones Wine loads. No lib32 packages needed.
+		return installPlan{commands: [][]string{
+			{"sudo", "pacman", "-S", "--needed", "--noconfirm", "gst-libav", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly"},
+		}}
+	case "debian":
+		// Multilib Wine: WC3 is 32-bit, so winegstreamer loads the i386 plugins; a
+		// 32-bit process cannot dlopen a 64-bit .so. Enable i386 and install both
+		// bitnesses (the :i386 set is the one that actually fixes the crash).
+		return installPlan{commands: [][]string{
+			{"sudo", "dpkg", "--add-architecture", "i386"},
+			{"sudo", "apt-get", "update"},
+			{"sudo", "apt-get", "install", "-y",
+				"gstreamer1.0-libav", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-bad", "gstreamer1.0-plugins-ugly",
+				"gstreamer1.0-libav:i386", "gstreamer1.0-plugins-good:i386", "gstreamer1.0-plugins-bad:i386", "gstreamer1.0-plugins-ugly:i386"},
+		}}
+	case "fedora", "rhel":
+		// The 32-bit (.i686) plugins are the ones a 32-bit winegstreamer loads.
+		// gstreamer1-plugin-libav (ffmpeg-free, main repo) is the current name; the
+		// old RPM Fusion gstreamer1-libav is retired.
+		return installPlan{
+			commands: [][]string{{"sudo", "dnf", "install", "-y",
+				"gstreamer1-plugin-libav", "gstreamer1-plugins-good", "gstreamer1-plugins-bad-free", "gstreamer1-plugins-ugly-free",
+				"gstreamer1-plugin-libav.i686", "gstreamer1-plugins-good.i686", "gstreamer1-plugins-bad-free.i686", "gstreamer1-plugins-ugly-free.i686"}},
+			note: "if an intro codec is still missing, enable RPM Fusion for the extra freeworld plugins",
+		}
+	case "suse":
+		// openSUSE ships 32-bit multilib as -32bit packages.
+		return installPlan{commands: [][]string{{"sudo", "zypper", "--non-interactive", "install",
+			"gstreamer-plugins-libav", "gstreamer-plugins-good", "gstreamer-plugins-bad", "gstreamer-plugins-ugly",
+			"gstreamer-plugins-libav-32bit", "gstreamer-plugins-good-32bit", "gstreamer-plugins-bad-32bit", "gstreamer-plugins-ugly-32bit"}}}
+	}
+	return installPlan{manual: true, note: "install the GStreamer codec plugins gst-libav + gst-plugins-good/bad/ugly, including the 32-bit variants Wine needs for a 32-bit game"}
 }
 
 func promptYesNo(q string) bool {
