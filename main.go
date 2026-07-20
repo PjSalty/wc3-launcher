@@ -171,24 +171,24 @@ func run() error {
 		cancel()
 	}
 
-	// 2b. Make there be no wrong door. Keep a stable copy of this binary next to
-	//     the game, put a "Warcraft III (Online)" icon on the desktop and in the
-	//     Start Menu, and re-aim any existing Warcraft III shortcut at us. Starting
-	//     the game directly skips the gateway setup and the relay tunnel, so the
-	//     player would land on a Battle.net screen that cannot connect and have no
-	//     idea why. Best-effort: none of this blocks play.
+	// 2b. Keep a stable copy of this binary next to the game EVERY launch, so a
+	//     shortcut (and the game) keep working even after the player deletes the
+	//     folder they unzipped, or downloads a newer build into a new folder.
+	//     Then, ONCE, put a "Warcraft III (Online)" icon on the desktop + in the
+	//     Start Menu and re-aim any existing Warcraft III shortcut at us - the
+	//     icon is installed on first run only, never recreated on later launches,
+	//     so deleting it sticks. WC3_NO_SHORTCUT=1 skips it entirely. Best-effort.
 	if stableExe, err := ensureStableLauncher(dir); err != nil {
-		fmt.Printf("(Could not set up the shortcut: %v)\n", err)
-	} else {
+		fmt.Printf("(Could not set up the stable launcher copy: %v)\n", err)
+	} else if os.Getenv("WC3_NO_SHORTCUT") == "" && !shortcutsInstalled() {
 		if err := desktop.EnsureShortcut(stableExe, gameRoot); err != nil {
 			fmt.Printf("(Could not create the shortcut: %v)\n", err)
 		} else {
-			fmt.Println(`A "Warcraft III (Online)" icon is on your desktop - use it to play.`)
-		}
-		if n, err := desktop.RepointGameShortcuts(stableExe, gameRoot); err != nil {
-			fmt.Printf("(Could not update the existing Warcraft III shortcuts: %v)\n", err)
-		} else if n > 0 {
-			fmt.Printf("Pointed %d existing Warcraft III shortcut(s) here, so any of them works.\n", n)
+			fmt.Println(`A "Warcraft III (Online)" icon is on your desktop - use it to play. (Delete it if you'd rather not; it won't come back.)`)
+			if n, err := desktop.RepointGameShortcuts(stableExe, gameRoot); err == nil && n > 0 {
+				fmt.Printf("Pointed %d existing Warcraft III shortcut(s) here, so any of them works.\n", n)
+			}
+			markShortcutsInstalled()
 		}
 	}
 

@@ -23,6 +23,9 @@ func TestFirstNonEmpty(t *testing.T) {
 // config-file layer is exercised by the JSON tag round-trip below; here the test
 // binary has no wc3-launcher.json next to it, so the file layer is empty.
 func TestResolveConnectionPrecedence(t *testing.T) {
+	// Sandbox the per-user config dir so a real seeded config on the dev box does
+	// not feed into resolveConnection's file layer and skew the precedence check.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	origServer, origToken, origPin := serverHost, relayToken, relayCertPin
 	t.Cleanup(func() { serverHost, relayToken, relayCertPin = origServer, origToken, origPin })
 
@@ -47,6 +50,26 @@ func TestResolveConnectionPrecedence(t *testing.T) {
 	resolveConnection("", "", "", "")
 	if relayCertPin != "compiled-pin" {
 		t.Fatalf("relayCertPin = %q, want compiled-pin (default preserved)", relayCertPin)
+	}
+}
+
+// TestShortcutInstallOnce proves the desktop icon is a one-time thing: before
+// the marker it reports not-installed, after markShortcutsInstalled it reports
+// installed (so later launches skip recreating it, even if the player deletes
+// the icon). XDG_CONFIG_HOME keeps the real ~/.config untouched.
+func TestShortcutInstallOnce(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	if shortcutsInstalled() {
+		t.Fatal("shortcutsInstalled true before any install")
+	}
+	markShortcutsInstalled()
+	if !shortcutsInstalled() {
+		t.Fatal("shortcutsInstalled false after markShortcutsInstalled")
+	}
+	// Deleting the icon must NOT reset the marker: a second launch stays a no-op.
+	if _, err := os.Stat(filepath.Join(dir, "wc3-launcher", "shortcuts-installed")); err != nil {
+		t.Fatalf("marker file missing after install: %v", err)
 	}
 }
 

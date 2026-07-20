@@ -33,6 +33,40 @@ func perUserConfigPath() (string, error) {
 	return filepath.Join(base, "wc3-launcher", "config.json"), nil
 }
 
+// shortcutMarkerPath is a flag file recording that the desktop/menu shortcut was
+// already installed once. Its presence stops later launches from recreating it,
+// so a player who deletes the icon keeps it gone.
+func shortcutMarkerPath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "wc3-launcher", "shortcuts-installed"), nil
+}
+
+// shortcutsInstalled reports whether the one-time shortcut install already ran.
+func shortcutsInstalled() bool {
+	p, err := shortcutMarkerPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
+}
+
+// markShortcutsInstalled records that the one-time shortcut install ran, so no
+// later launch recreates the icon.
+func markShortcutsInstalled() {
+	p, err := shortcutMarkerPath()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte("installed\n"), 0o644)
+}
+
 // configPaths lists where loadFileConfig looks, in order: next to the binary
 // first (drop a file next to the exe and run), then the per-user config dir.
 func configPaths() []string {
