@@ -21,17 +21,61 @@ type fileConfig struct {
 	Gateway string `json:"gateway"`
 }
 
-// configPaths lists where loadFileConfig looks, in order: next to the binary
-// first (drop a file next to the exe and run), then the per-user config dir
+// perUserConfigPath is the stable per-user config file
 // (%AppData%\wc3-launcher\config.json on Windows, ~/.config/wc3-launcher/... on
-// Linux).
+// Linux). It is the second place loadFileConfig looks and the file saveFileConfig
+// writes, so both derive it from here.
+func perUserConfigPath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "wc3-launcher", "config.json"), nil
+}
+
+// shortcutMarkerPath is a flag file recording that the desktop/menu shortcut was
+// already installed once. Its presence stops later launches from recreating it,
+// so a player who deletes the icon keeps it gone.
+func shortcutMarkerPath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "wc3-launcher", "shortcuts-installed"), nil
+}
+
+// shortcutsInstalled reports whether the one-time shortcut install already ran.
+func shortcutsInstalled() bool {
+	p, err := shortcutMarkerPath()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(p)
+	return err == nil
+}
+
+// markShortcutsInstalled records that the one-time shortcut install ran, so no
+// later launch recreates the icon.
+func markShortcutsInstalled() {
+	p, err := shortcutMarkerPath()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte("installed\n"), 0o644)
+}
+
+// configPaths lists where loadFileConfig looks, in order: next to the binary
+// first (drop a file next to the exe and run), then the per-user config dir.
 func configPaths() []string {
 	var paths []string
 	if exe, err := os.Executable(); err == nil {
 		paths = append(paths, filepath.Join(filepath.Dir(exe), "wc3-launcher.json"))
 	}
-	if base, err := os.UserConfigDir(); err == nil {
-		paths = append(paths, filepath.Join(base, "wc3-launcher", "config.json"))
+	if p, err := perUserConfigPath(); err == nil {
+		paths = append(paths, p)
 	}
 	return paths
 }
@@ -62,15 +106,13 @@ func loadFileConfig() fileConfig {
 // straight back up, so nobody re-enters their server after the first time. Mode
 // 0600 (dir 0700) because the token, if present, is mildly sensitive.
 func saveFileConfig(cfg fileConfig) (string, error) {
-	base, err := os.UserConfigDir()
+	path, err := perUserConfigPath()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(base, "wc3-launcher")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "config.json")
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err
@@ -98,6 +140,47 @@ func resolveConnection(serverFlag, tokenFlag, certPinFlag, gatewayFlag string) {
 // stock public build still pointing at the placeholder).
 func isConfigured() bool {
 	return serverHost != "" && serverHost != placeholderHost
+}
+
+// seedPerUserConfig copies the active connection settings into the per-user
+// config on first run, so a relaunch from the stable copy (or a later download
+// into a new folder) keeps working without re-entering anything. A preconfigured
+// build ships wc3-launcher.json next to the binary, but that file is only read
+// from the folder it sits in; ensureStableLauncher aims the desktop/Start-Menu
+// shortcuts at a stable copy elsewhere, which would otherwise see no config and
+// re-prompt for a token the player does not have. The per-user file is read from
+// any location, closing that gap.
+//
+// It writes only when a real server is configured and no per-user config exists
+// yet, so it never clobbers a file the player already has, and a next-to-binary
+// wc3-launcher.json still wins while present (higher precedence in configPaths).
+func seedPerUserConfig() {
+	if !isConfigured() {
+		return
+	}
+	path, err := perUserConfigPath()
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(path); err == nil {
+		return // already present: leave the player's file untouched
+	}
+	// shortcut: best-effort seed; a write failure just means the next run retries.
+	_, _ = saveFileConfig(fileConfig{Server: serverHost, Token: relayToken, CertPin: relayCertPin, Gateway: gatewayName})
+}
+
+// mapsBaseURL is where the launcher syncs the curated map library from. It is
+// derived from the configured server (https://<serverHost>:<mapsPort>) so there
+// is nothing extra to set up, with WC3_MAPS_URL as an override for an unusual
+// layout. Empty when no real server is configured (nothing to sync from).
+func mapsBaseURL() string {
+	if v := strings.TrimRight(os.Getenv("WC3_MAPS_URL"), "/"); v != "" {
+		return v
+	}
+	if !isConfigured() {
+		return ""
+	}
+	return fmt.Sprintf("https://%s:%s", serverHost, mapsPort)
 }
 
 // maybeInteractiveSetup is the "download and just enter your server" path for a

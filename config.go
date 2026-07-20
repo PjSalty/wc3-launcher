@@ -47,6 +47,12 @@ const (
 	// relayPort is the relay daemon's tunnel port on serverHost.
 	relayPort = "7000"
 
+	// mapsPort is the map daemon's port on serverHost. The launcher syncs the
+	// server's curated, read-only map library from https://<serverHost>:<mapsPort>
+	// at startup so every player has the same maps. Same host as the realm and
+	// relay; a distinct port.
+	mapsPort = "7443"
+
 	// hostGatewayHost points WC3's Battle.net gateway at the local BnetGateway so
 	// the host's realm session rides the relay (which pins the game address).
 	hostGatewayHost = "127.0.0.1"

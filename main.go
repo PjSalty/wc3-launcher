@@ -25,11 +25,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"wc3-launcher/internal/bundle"
 	"wc3-launcher/internal/client"
 	"wc3-launcher/internal/desktop"
 	"wc3-launcher/internal/installer"
+	"wc3-launcher/internal/mapsync"
 	"wc3-launcher/internal/relaylink"
 )
 
@@ -70,6 +72,12 @@ func run() error {
 	// serverHost, relayToken, relayCertPin, so a stock binary can point at any
 	// server without a rebuild. Nothing set falls back to the compiled-in value.
 	resolveConnection(*serverFlag, *tokenFlag, *certPinFlag, *gatewayFlag)
+
+	// Persist a preconfigured build's settings (server + token + cert pin) to the
+	// per-user config on first run, so the desktop shortcut - which points at a
+	// stable copy of the binary that has no wc3-launcher.json next to it - keeps
+	// working instead of re-prompting for a token the player was never given.
+	seedPerUserConfig()
 
 	// Resolve the game/prefix folder up front: migration reads the realm an older
 	// launcher wrote into the game's registry, so we need it before deciding
@@ -146,24 +154,41 @@ func run() error {
 		return fmt.Errorf("adding loader and maps: %w", err)
 	}
 
-	// 2b. Make there be no wrong door. Keep a stable copy of this binary next to
-	//     the game, put a "Warcraft III (Online)" icon on the desktop and in the
-	//     Start Menu, and re-aim any existing Warcraft III shortcut at us. Starting
-	//     the game directly skips the gateway setup and the relay tunnel, so the
-	//     player would land on a Battle.net screen that cannot connect and have no
-	//     idea why. Best-effort: none of this blocks play.
+	// 2c. Sync the server's curated, read-only map library into Maps/Download so
+	//     everyone hosts and joins from the same set and nobody waits on an in-game
+	//     map transfer. Strictly additive: it never overwrites or deletes a local
+	//     map, so a player's own maps are safe. Best effort: a sync failure never
+	//     blocks play, and there is no upload path (see internal/mapsync).
+	if base := mapsBaseURL(); base != "" {
+		mapsDir := filepath.Join(gameRoot, "Maps", "Download")
+		syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		mapsLog := log.New(os.Stdout, "maps ", log.LstdFlags|log.Lmsgprefix)
+		if n, err := mapsync.Sync(syncCtx, base, mapsDir, relayTLSConfig(serverHost), mapsLog); err != nil {
+			fmt.Printf("(Map sync skipped: %v)\n", err)
+		} else if n > 0 {
+			fmt.Printf("Synced %d map(s) from the server.\n", n)
+		}
+		cancel()
+	}
+
+	// 2b. Keep a stable copy of this binary next to the game EVERY launch, so a
+	//     shortcut (and the game) keep working even after the player deletes the
+	//     folder they unzipped, or downloads a newer build into a new folder.
+	//     Then, ONCE, put a "Warcraft III (Online)" icon on the desktop + in the
+	//     Start Menu and re-aim any existing Warcraft III shortcut at us - the
+	//     icon is installed on first run only, never recreated on later launches,
+	//     so deleting it sticks. WC3_NO_SHORTCUT=1 skips it entirely. Best-effort.
 	if stableExe, err := ensureStableLauncher(dir); err != nil {
-		fmt.Printf("(Could not set up the shortcut: %v)\n", err)
-	} else {
+		fmt.Printf("(Could not set up the stable launcher copy: %v)\n", err)
+	} else if os.Getenv("WC3_NO_SHORTCUT") == "" && !shortcutsInstalled() {
 		if err := desktop.EnsureShortcut(stableExe, gameRoot); err != nil {
 			fmt.Printf("(Could not create the shortcut: %v)\n", err)
 		} else {
-			fmt.Println(`A "Warcraft III (Online)" icon is on your desktop - use it to play.`)
-		}
-		if n, err := desktop.RepointGameShortcuts(stableExe, gameRoot); err != nil {
-			fmt.Printf("(Could not update the existing Warcraft III shortcuts: %v)\n", err)
-		} else if n > 0 {
-			fmt.Printf("Pointed %d existing Warcraft III shortcut(s) here, so any of them works.\n", n)
+			fmt.Println(`A "Warcraft III (Online)" icon is on your desktop - use it to play. (Delete it if you'd rather not; it won't come back.)`)
+			if n, err := desktop.RepointGameShortcuts(stableExe, gameRoot); err == nil && n > 0 {
+				fmt.Printf("Pointed %d existing Warcraft III shortcut(s) here, so any of them works.\n", n)
+			}
+			markShortcutsInstalled()
 		}
 	}
 

@@ -105,6 +105,23 @@ play access is the PvPGN account login. The published release builds are always
 generic (no address or token compiled in), so a downloaded binary never carries
 anyone's server details.
 
+### Ship a preconfigured build to your friends
+
+To hand friends a zip they just unzip and run, with your server already baked in,
+use `hack/package-preconfigured.sh`. It downloads the signed release binaries and
+drops a `wc3-launcher.json` next to each. Your settings come from the environment,
+so the token never lands in your shell history:
+
+```bash
+export WC3_SERVER="realm.example.net"
+export WC3_RELAY_TOKEN="$(your-secret-tool get wc3/relay_token)"
+export WC3_GATEWAY="My Realm"        # optional
+./hack/package-preconfigured.sh      # -> dist/wc3-launcher-{windows,linux}.zip
+```
+
+Each zip carries the launcher, its config, and a short README, and the script
+verifies the release checksums before packaging.
+
 ## For maintainers
 
 ```bash
