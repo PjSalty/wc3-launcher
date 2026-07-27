@@ -49,12 +49,26 @@ func TestSyncAdditiveAndSafe(t *testing.T) {
 	}
 
 	logger := log.New(io.Discard, "", 0)
-	n, err := Sync(context.Background(), srv.URL, dir, nil, logger)
+	rep := &captureReporter{}
+	n, err := Sync(context.Background(), srv.URL, dir, nil, logger, rep)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
 	if n != 1 {
 		t.Fatalf("added %d, want 1 (good only; mine skipped, bad rejected, evil unsafe)", n)
+	}
+	// The reporter's plan is the maps it will ATTEMPT: good + bad (mine is already
+	// present, evil has an unsafe name, both filtered before download). bad then
+	// fails hash verification at download time, so Done reports 1 written. The bar
+	// getting byte updates proves the streaming progress path is wired.
+	if rep.planMaps != 2 {
+		t.Errorf("reporter Plan maps = %d, want 2 (good + bad attempted)", rep.planMaps)
+	}
+	if rep.updates == 0 {
+		t.Error("reporter got no Update calls during the download")
+	}
+	if rep.done != 1 {
+		t.Errorf("reporter Done added = %d, want 1", rep.done)
 	}
 
 	// The local custom map must be byte-for-byte untouched.
@@ -75,17 +89,30 @@ func TestSyncAdditiveAndSafe(t *testing.T) {
 	}
 
 	// Re-sync is a no-op: everything present is left alone.
-	if n2, err := Sync(context.Background(), srv.URL, dir, nil, logger); err != nil || n2 != 0 {
+	if n2, err := Sync(context.Background(), srv.URL, dir, nil, logger, nil); err != nil || n2 != 0 {
 		t.Errorf("re-sync added %d (err %v), want 0", n2, err)
 	}
 }
+
+// captureReporter records the progress callbacks so a test can assert the bar is
+// driven correctly. A nil *captureReporter is not used; Sync takes nil directly.
+type captureReporter struct {
+	planMaps  int
+	planBytes int64
+	updates   int
+	done      int
+}
+
+func (c *captureReporter) Plan(maps int, bytes int64)             { c.planMaps, c.planBytes = maps, bytes }
+func (c *captureReporter) Update(done int, bytes int64, s string) { c.updates++ }
+func (c *captureReporter) Done(added int)                         { c.done = added }
 
 func TestSyncManifestError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	if _, err := Sync(context.Background(), srv.URL, t.TempDir(), nil, log.New(io.Discard, "", 0)); err == nil {
+	if _, err := Sync(context.Background(), srv.URL, t.TempDir(), nil, log.New(io.Discard, "", 0), nil); err == nil {
 		t.Error("expected an error when the manifest fetch fails")
 	}
 }
