@@ -38,6 +38,35 @@ const (
 	maxSyncBytes = 20 << 30 // 20 GiB total written per run
 )
 
+// Reporter receives map-sync progress so a caller can draw a progress bar. A nil
+// Reporter disables reporting. Its methods are called from Sync's goroutine.
+type Reporter interface {
+	// Plan is called once, before any download, with the number of maps and the
+	// total bytes that will be fetched (maps already present locally are excluded).
+	Plan(maps int, bytes int64)
+	// Update is called as bytes arrive: done is completed maps, bytes is the total
+	// downloaded so far (including the in-flight map), cur is its filename.
+	Update(done int, bytes int64, cur string)
+	// Done is called once when the sync finishes, with the number of maps written.
+	Done(added int)
+}
+
+// progressReader reports each chunk read from the wrapped reader. It does not
+// change what is read - the caller still caps the body and verifies its full
+// SHA-256 before writing - it only observes byte counts for the progress bar.
+type progressReader struct {
+	r      io.Reader
+	onRead func(int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 && p.onRead != nil {
+		p.onRead(int64(n))
+	}
+	return n, err
+}
+
 // Sync pulls every map in the server's manifest whose name is not already
 // present in mapsDir, and returns how many it wrote. It is best-effort: a
 // manifest that cannot be fetched is returned as an error (the caller logs and
@@ -49,7 +78,7 @@ const (
 // (which may be the player's own map) always wins. The curated library gives new
 // or updated maps new, versioned names, so this never blocks getting new maps.
 // tlsConf pins the server certificate when the build has a pin; nil uses defaults.
-func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, logger *log.Logger) (int, error) {
+func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, logger *log.Logger, reporter Reporter) (int, error) {
 	client := &http.Client{
 		Timeout:   10 * time.Minute,
 		Transport: &http.Transport{TLSClientConfig: tlsConf},
@@ -63,13 +92,19 @@ func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, log
 		return 0, fmt.Errorf("creating maps folder: %w", err)
 	}
 
-	added := 0
-	var written int64
-	for i, e := range man.Maps {
-		// Aggregate budget: a hostile or compromised server cannot fill the disk
-		// by advertising a huge manifest. A curated library is far below these.
-		if i >= maxSyncMaps || written >= maxSyncBytes {
-			logger.Printf("map sync budget reached (%d maps, %d bytes); stopping", i, written)
+	// Plan the run first so the progress bar knows the real total up front: keep
+	// only maps with a safe name that we do not already have (never overwrite a
+	// local file, possibly the player's own). The same aggregate budget bounds the
+	// plan, so a hostile manifest cannot blow up the totals either.
+	type planItem struct {
+		name string
+		e    maplib.Entry
+	}
+	var plan []planItem
+	var planBytes int64
+	for _, e := range man.Maps {
+		if len(plan) >= maxSyncMaps || planBytes >= maxSyncBytes {
+			logger.Printf("map sync budget reached (%d maps, %d bytes); stopping", len(plan), planBytes)
 			break
 		}
 		name, ok := maplib.SafeName(e.Name)
@@ -77,17 +112,41 @@ func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, log
 			logger.Printf("skipping map with unsafe name %q", e.Name)
 			continue
 		}
-		dest := filepath.Join(mapsDir, name)
-		if _, err := os.Stat(dest); err == nil {
+		if _, err := os.Stat(filepath.Join(mapsDir, name)); err == nil {
 			continue // already have a map by this name - never overwrite it
 		}
-		n, err := downloadOne(ctx, client, baseURL, dest, name, e)
+		plan = append(plan, planItem{name: name, e: e})
+		planBytes += e.Size
+	}
+	if reporter != nil {
+		reporter.Plan(len(plan), planBytes)
+	}
+
+	added := 0
+	var written int64
+	for _, it := range plan {
+		if written >= maxSyncBytes {
+			logger.Printf("map sync byte budget reached (%d bytes); stopping", written)
+			break
+		}
+		dest := filepath.Join(mapsDir, it.name)
+		var cur int64 // bytes of the in-flight map, for the running total
+		onRead := func(n int64) {
+			cur += n
+			if reporter != nil {
+				reporter.Update(added, written+cur, it.name)
+			}
+		}
+		n, err := downloadOne(ctx, client, baseURL, dest, it.name, it.e, onRead)
 		if err != nil {
-			logger.Printf("skipping %s: %v", name, err)
+			logger.Printf("skipping %s: %v", it.name, err)
 			continue
 		}
 		written += n
 		added++
+	}
+	if reporter != nil {
+		reporter.Done(added)
 	}
 	return added, nil
 }
@@ -116,7 +175,7 @@ func fetchManifest(ctx context.Context, c *http.Client, baseURL string) (maplib.
 // downloadOne fetches one map, verifies it in full BEFORE writing (size cap,
 // SHA-256 against the manifest, map header), then writes it without ever
 // clobbering an existing local file. It returns the number of bytes written.
-func downloadOne(ctx context.Context, c *http.Client, baseURL, dest, name string, e maplib.Entry) (int64, error) {
+func downloadOne(ctx context.Context, c *http.Client, baseURL, dest, name string, e maplib.Entry, onRead func(int64)) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/maps/"+url.PathEscape(name), nil)
 	if err != nil {
 		return 0, err
@@ -130,7 +189,13 @@ func downloadOne(ctx context.Context, c *http.Client, baseURL, dest, name string
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	// One byte over the cap so an oversized body is detected, not silently cut.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maplib.MaxMapSize+1))
+	// The progressReader only observes chunk sizes; the LimitReader still caps the
+	// body and the SHA-256 below still verifies every byte before anything is kept.
+	var src io.Reader = io.LimitReader(resp.Body, maplib.MaxMapSize+1)
+	if onRead != nil {
+		src = &progressReader{r: src, onRead: onRead}
+	}
+	body, err := io.ReadAll(src)
 	if err != nil {
 		return 0, err
 	}

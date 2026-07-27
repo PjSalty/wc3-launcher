@@ -163,9 +163,11 @@ func run() error {
 		mapsDir := filepath.Join(gameRoot, "Maps", "Download")
 		syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		mapsLog := log.New(os.Stdout, "maps ", log.LstdFlags|log.Lmsgprefix)
-		if n, err := mapsync.Sync(syncCtx, base, mapsDir, relayTLSConfig(serverHost), mapsLog); err != nil {
+		bar := newMapBar()
+		if n, err := mapsync.Sync(syncCtx, base, mapsDir, relayTLSConfig(serverHost), mapsLog, bar); err != nil {
 			fmt.Printf("(Map sync skipped: %v)\n", err)
-		} else if n > 0 {
+		} else if n > 0 && !bar.tty {
+			// On a terminal the bar already printed a summary; otherwise log one line.
 			fmt.Printf("Synced %d map(s) from the server.\n", n)
 		}
 		cancel()
@@ -453,4 +455,80 @@ func stableGameDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".local", "share", gameSubdir), nil
+}
+
+// mapBar renders map-sync progress as a single, overwriting console line (a
+// mapsync.Reporter). On a non-terminal stdout it stays silent so redirected or
+// piped output is not spammed with carriage returns; the caller logs a one-line
+// summary in that case instead.
+type mapBar struct {
+	tty      bool
+	maps     int
+	total    int64
+	lastDraw time.Time
+}
+
+func newMapBar() *mapBar {
+	tty := false
+	if fi, err := os.Stdout.Stat(); err == nil {
+		tty = fi.Mode()&os.ModeCharDevice != 0
+	}
+	return &mapBar{tty: tty}
+}
+
+func (b *mapBar) Plan(maps int, bytes int64) {
+	b.maps, b.total = maps, bytes
+	if b.tty && maps > 0 {
+		fmt.Printf("Downloading %d map(s) from the server (%s)\n", maps, humanBytes(bytes))
+	}
+}
+
+func (b *mapBar) Update(done int, bytes int64, cur string) {
+	if !b.tty || b.maps == 0 {
+		return
+	}
+	// Throttle redraws to keep the console readable; always draw the final frame.
+	now := time.Now()
+	if now.Sub(b.lastDraw) < 80*time.Millisecond && bytes < b.total {
+		return
+	}
+	b.lastDraw = now
+	fmt.Print("\r" + b.line(done, bytes, cur))
+}
+
+func (b *mapBar) Done(added int) {
+	if !b.tty || b.maps == 0 {
+		return
+	}
+	fmt.Print("\r" + b.line(added, b.total, "done") + "\n")
+}
+
+func (b *mapBar) line(done int, bytes int64, cur string) string {
+	const width = 24
+	frac := 0.0
+	if b.total > 0 {
+		frac = float64(bytes) / float64(b.total)
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(frac * width)
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
+	// Fixed-width tail so a shorter map name fully overwrites a longer previous one.
+	return fmt.Sprintf("  [%s] %3.0f%%  %d/%d  %s/%s  %-28.28s",
+		bar, frac*100, done, b.maps, humanBytes(bytes), humanBytes(b.total), cur)
+}
+
+// humanBytes formats a byte count as a short human-readable string (e.g. 12.3MB).
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
