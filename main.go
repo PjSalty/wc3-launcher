@@ -10,6 +10,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -37,6 +38,12 @@ import (
 
 func main() {
 	if err := run(); err != nil {
+		// A deliberate Ctrl-C is not an error: leave quietly, no scary message and
+		// no "press Enter" that a closing window would never answer.
+		if errors.Is(err, errCancelled) {
+			fmt.Println("Cancelled.")
+			os.Exit(0)
+		}
 		if errors.Is(err, errAlreadyRunning) {
 			fmt.Println("\nThe launcher is already running in another window.")
 			fmt.Println("Close that window first, or just switch to it - you are already connected there.")
@@ -212,7 +219,10 @@ func run() error {
 	if err := client.Configure(dir, serverHost, gatewayName, gatewayTimezone); err != nil {
 		return fmt.Errorf("configuring gateway: %w", err)
 	}
-	classic := chooseClassic()
+	classic, err := chooseClassic(context.Background())
+	if err != nil {
+		return err // errCancelled: nothing started yet, so nothing to unwind
+	}
 	fmt.Println("Launching Warcraft III...")
 	if _, err := client.Launch(dir, gameRoot, loaderExe, classic); err != nil {
 		return fmt.Errorf("launching game: %w", err)
@@ -229,6 +239,11 @@ var errRelayUnreachable = errors.New("relay unreachable")
 // gateway port, so this one exits with a friendly message rather than launch a
 // second game that cannot connect.
 var errAlreadyRunning = errors.New("launcher already running")
+
+// errCancelled means the player deliberately backed out (Ctrl-C at a prompt). It
+// is not a failure: main() exits 0 quietly rather than showing an error and
+// asking them to press Enter.
+var errCancelled = errors.New("cancelled")
 
 // connectViaRelay dials the host relay and, on success, points WC3 at the local
 // gateway, launches the game, and stays resident serving the tunnel so a native
@@ -272,7 +287,15 @@ func connectViaRelay(dir, gameRoot string) error {
 		link.GameOver()
 		return fmt.Errorf("setting host game port: %w", err)
 	}
-	classic := chooseClassic()
+	// Cancelling here must unwind exactly like the error paths above: the local
+	// gateway listener is already holding 6112, and leaving it held is what made
+	// the next launch report "already running in another window".
+	classic, err := chooseClassic(ctx)
+	if err != nil {
+		gateLn.Close()
+		link.GameOver()
+		return err
+	}
 	fmt.Println("Launching Warcraft III...")
 	cmd, err := client.Launch(dir, gameRoot, loaderExe, classic)
 	if err != nil {
@@ -323,15 +346,54 @@ func relayTLSConfig(host string) *tls.Config {
 // chooseClassic asks whether to launch Reign of Chaos (classic) or the default
 // Frozen Throne expansion, and returns true for Reign of Chaos. Enter defaults
 // to Frozen Throne.
-func chooseClassic() bool {
+//
+// It returns errCancelled when the player presses Ctrl-C. That case needs
+// handling rather than the runtime default: in relay-host mode run() has already
+// installed a signal.NotifyContext for os.Interrupt, which DISABLES Go's default
+// terminate-on-SIGINT. Without the select below, Ctrl-C at this prompt cancelled
+// a context nobody was reading while the stdin read kept blocking, so the
+// keypress did nothing at all and the only way out was closing the window, which
+// left the local gateway port held and produced the stale "already running"
+// state on the next launch.
+func chooseClassic(parent context.Context) (bool, error) {
+	// Also catch the signal directly, so the prompt is cancellable on the direct
+	// path too, where no interrupt handler is installed.
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt)
+	defer stop()
+
 	fmt.Println()
 	fmt.Println("Which game do you want to play?")
 	fmt.Println("  [1] Warcraft III: The Frozen Throne  (expansion, default)")
 	fmt.Println("  [2] Warcraft III: Reign of Chaos     (classic)")
 	fmt.Print("Enter 1 or 2 [1]: ")
-	var in string
-	_, _ = fmt.Scanln(&in)
-	return strings.TrimSpace(in) == "2"
+
+	type answer struct {
+		line string
+		err  error
+	}
+	// Buffered so this goroutine cannot leak if we return on cancellation first.
+	ch := make(chan answer, 1)
+	go func() {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		ch <- answer{line, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		fmt.Println()
+		return false, errCancelled
+	case a := <-ch:
+		if a.err != nil {
+			// EOF (Ctrl-D, or stdin closed/piped) is not a cancellation: take the
+			// documented default rather than hanging or failing.
+			if errors.Is(a.err, io.EOF) {
+				fmt.Println()
+				return false, nil
+			}
+			return false, errCancelled
+		}
+		return strings.TrimSpace(a.line) == "2", nil
+	}
 }
 
 // gameDir returns the folder that holds the game and, on Linux, its Wine prefix.
