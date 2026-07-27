@@ -82,14 +82,19 @@ func installWine() error {
 // Vulkan runtime when it looks missing. Best-effort: it warns and returns rather
 // than failing, so it can never block a launch that would have worked.
 func ensureVulkan() {
-	if hasVulkan32() {
+	a := detectWineArch()
+	if hasVulkanForWine(a) {
 		return
 	}
 	d := detectDistro()
-	plan := d.vulkanInstall()
+	plan := d.vulkanInstall(a)
 
+	bits := "32-bit"
+	if !a.needs32() {
+		bits = "64-bit"
+	}
 	fmt.Println()
-	fmt.Println("Warcraft III renders through DXVK (Vulkan), and a 32-bit Vulkan driver")
+	fmt.Printf("Warcraft III renders through DXVK (Vulkan), and a %s Vulkan driver\n", bits)
 	fmt.Println("does not look installed. Without it the game crashes on startup (a")
 	fmt.Println("flicker, then it closes).")
 
@@ -105,7 +110,7 @@ func ensureVulkan() {
 	if plan.note != "" {
 		fmt.Printf("(%s)\n\n", plan.note)
 	}
-	if !promptYesNo("Install the 32-bit Vulkan driver now? (asks for your sudo password)") {
+	if !promptYesNo(fmt.Sprintf("Install the %s Vulkan driver now? (asks for your sudo password)", bits)) {
 		fmt.Println("Skipping. If the game crashes on launch, install it and retry.")
 		return
 	}
@@ -121,15 +126,109 @@ func ensureVulkan() {
 	fmt.Println("Vulkan driver installed. Continuing.")
 }
 
-// hasVulkan32 heuristically reports whether a 32-bit Vulkan loader is present, by
-// looking for libvulkan.so.1 in the usual 32-bit library paths. Not exhaustive,
-// but it catches the common fresh-install gap where only the 64-bit loader (or
-// none) exists.
-func hasVulkan32() bool {
-	for _, p := range []string{
+// wineArch is the thing that actually decides which host libraries a 32-bit
+// Windows game needs. It is NOT a property of the distro: the same distro ships
+// different Wine builds over time, so keying off the distro family (as this code
+// used to) silently breaks whenever a distro moves.
+//
+//	multilib  classic WoW64. The 32-bit game runs as a 32-bit Unix process, so it
+//	          needs 32-bit host Vulkan and 32-bit GStreamer plugins. A 32-bit
+//	          process cannot dlopen a 64-bit .so, so 64-bit copies do not count.
+//	newWoW64  Wine 10/11 style. The 32-bit game is served by a 64-bit Unix
+//	          process, so the 64-bit host libraries are the ones that matter and
+//	          installing 32-bit packages fixes nothing (on Arch they do not exist).
+type wineArch int
+
+const (
+	wineArchUnknown wineArch = iota
+	wineArchMultilib
+	wineArchNewWoW64
+)
+
+func (a wineArch) needs32() bool { return a != wineArchNewWoW64 }
+
+// wineLibRoots lists the directories a Wine install keeps its per-arch loaders
+// in, derived from the resolved `wine` binary first (so a Wine in /opt or
+// ~/.local is found) and then the usual system locations.
+func wineLibRoots() []string {
+	var roots []string
+	if p, err := exec.LookPath("wine"); err == nil {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			p = real
+		}
+		// <prefix>/bin/wine -> <prefix>/lib{,64}/wine
+		base := filepath.Dir(filepath.Dir(p))
+		roots = append(roots,
+			filepath.Join(base, "lib", "wine"),
+			filepath.Join(base, "lib64", "wine"),
+			filepath.Join(base, "lib", "x86_64-linux-gnu", "wine"),
+		)
+	}
+	return append(roots,
+		"/usr/lib/wine",
+		"/usr/lib64/wine",
+		"/usr/lib/x86_64-linux-gnu/wine",
+		"/opt/wine-stable/lib/wine",
+		"/opt/wine-staging/lib/wine",
+	)
+}
+
+// detectWineArch reports how this Wine build runs a 32-bit game, by looking for
+// the arch-specific loader directories Wine installs. A build that can run a
+// 32-bit game as a 32-bit Unix process ships `i386-unix`; a new-WoW64 build ships
+// only `x86_64-unix` (its 32-bit support is PE-side, under `i386-windows`).
+// Unknown when Wine is absent or laid out unusually, and callers then check both
+// bitnesses so we prompt rather than falsely skip.
+func detectWineArch() wineArch { return wineArchFromRoots(wineLibRoots()) }
+
+// wineArchFromRoots is the testable core of detectWineArch.
+func wineArchFromRoots(roots []string) wineArch {
+	for _, root := range roots {
+		if isDir(filepath.Join(root, "i386-unix")) {
+			return wineArchMultilib
+		}
+		// Only conclude new-WoW64 once we have seen a real Wine tree that has the
+		// 64-bit loader and no 32-bit one.
+		if isDir(filepath.Join(root, "x86_64-unix")) {
+			return wineArchNewWoW64
+		}
+	}
+	return wineArchUnknown
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// vulkanLoaderPaths returns the libvulkan locations that matter for THIS Wine
+// build. Unknown arch checks both, so a missing loader still prompts.
+func vulkanLoaderPaths(a wineArch) []string {
+	lib32 := []string{
 		"/usr/lib/i386-linux-gnu/libvulkan.so.1", // debian / ubuntu multiarch
-		"/usr/lib32/libvulkan.so.1",              // arch and others
-	} {
+		"/usr/lib32/libvulkan.so.1",              // arch, suse
+		"/usr/lib/libvulkan.so.1",                // fedora: /usr/lib is the 32-bit tree
+	}
+	lib64 := []string{
+		"/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+		"/usr/lib64/libvulkan.so.1",
+		"/usr/lib/libvulkan.so.1", // arch: /usr/lib is 64-bit
+	}
+	switch a {
+	case wineArchMultilib:
+		return lib32
+	case wineArchNewWoW64:
+		return lib64
+	}
+	return append(lib32, lib64...)
+}
+
+// hasVulkanForWine reports whether a Vulkan loader of the bitness this Wine build
+// actually needs is present. The old version only ever looked at 32-bit paths,
+// so on a new-WoW64 setup it demanded 32-bit packages that were neither needed
+// nor, on Arch, installable.
+func hasVulkanForWine(a wineArch) bool {
+	for _, p := range vulkanLoaderPaths(a) {
 		if _, err := os.Stat(p); err == nil {
 			return true
 		}
@@ -142,11 +241,12 @@ func hasVulkan32() bool {
 // effort: it warns and returns rather than failing, so it can never block a
 // launch that would have worked.
 func ensureGstreamer() {
+	a := detectWineArch()
 	d := detectDistro()
-	if d.hasGstreamerCodecs() {
+	if d.hasGstreamerCodecs(a) {
 		return
 	}
-	plan := d.gstreamerInstall()
+	plan := d.gstreamerInstall(a)
 
 	fmt.Println()
 	fmt.Println("Warcraft III plays its intro videos through GStreamer, and the codec")
@@ -190,8 +290,8 @@ func ensureGstreamer() {
 // Arch is pure WoW64, where a 32-bit app uses the 64-bit host plugins, so there
 // the 64-bit dir is the right one. Checking the wrong-bitness dir was why the
 // v1.3.1 check falsely passed on multilib boxes and skipped the real fix.
-func (d distro) hasGstreamerCodecs() bool {
-	for _, dir := range d.gstreamerPluginDirs() {
+func (d distro) hasGstreamerCodecs(a wineArch) bool {
+	for _, dir := range d.gstreamerPluginDirs(a) {
 		if _, err := os.Stat(filepath.Join(dir, "libgstlibav.so")); err == nil {
 			return true
 		}
@@ -199,22 +299,43 @@ func (d distro) hasGstreamerCodecs() bool {
 	return false
 }
 
-// gstreamerPluginDirs returns the plugin dir(s) that hold the codec Wine needs on
-// this distro: the 32-bit multilib path on Debian/Fedora/SUSE, and the plain
-// 64-bit path on Arch (WoW64). Unknown distros check the common 32-bit spots so we
-// prompt rather than falsely skip.
-func (d distro) gstreamerPluginDirs() []string {
-	switch d.family() {
-	case "debian":
-		return []string{"/usr/lib/i386-linux-gnu/gstreamer-1.0"} // i386 multiarch
-	case "fedora", "rhel", "suse":
-		return []string{"/usr/lib/gstreamer-1.0"} // 32-bit multilib dir (/usr/lib64 is 64-bit)
-	case "arch":
-		return []string{"/usr/lib/gstreamer-1.0"} // WoW64: 64-bit host plugins
+// gstreamerPluginDirs returns the plugin dir(s) holding the codec Wine loads for
+// a 32-bit game. The BITNESS comes from the Wine build (a), the PATH LAYOUT from
+// the distro, because those are two independent facts: Debian with a new-WoW64
+// Wine needs the x86_64 multiarch dir, and the same Debian with a classic Wine
+// needs the i386 one. Unknown values check every candidate, so we prompt rather
+// than falsely skip (the v1.3.1 bug).
+func (d distro) gstreamerPluginDirs(a wineArch) []string {
+	lib32 := map[string][]string{
+		"debian": {"/usr/lib/i386-linux-gnu/gstreamer-1.0"},
+		"fedora": {"/usr/lib/gstreamer-1.0"}, // /usr/lib is the 32-bit tree here
+		"rhel":   {"/usr/lib/gstreamer-1.0"},
+		"suse":   {"/usr/lib32/gstreamer-1.0", "/usr/lib/gstreamer-1.0"},
+		"arch":   {"/usr/lib32/gstreamer-1.0"},
+	}
+	lib64 := map[string][]string{
+		"debian": {"/usr/lib/x86_64-linux-gnu/gstreamer-1.0"},
+		"fedora": {"/usr/lib64/gstreamer-1.0"},
+		"rhel":   {"/usr/lib64/gstreamer-1.0"},
+		"suse":   {"/usr/lib64/gstreamer-1.0"},
+		"arch":   {"/usr/lib/gstreamer-1.0"}, // /usr/lib is 64-bit on Arch
+	}
+	fam := d.family()
+	switch a {
+	case wineArchMultilib:
+		if v, ok := lib32[fam]; ok {
+			return v
+		}
+	case wineArchNewWoW64:
+		if v, ok := lib64[fam]; ok {
+			return v
+		}
 	}
 	return []string{
 		"/usr/lib/i386-linux-gnu/gstreamer-1.0",
 		"/usr/lib32/gstreamer-1.0",
+		"/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
+		"/usr/lib64/gstreamer-1.0",
 		"/usr/lib/gstreamer-1.0",
 	}
 }
@@ -349,15 +470,39 @@ func (d distro) wineInstall() installPlan {
 
 // vulkanInstall is how we would install a 32-bit Vulkan loader + driver on this
 // distro. WC3 1.28 is a 32-bit app, so the 64-bit loader alone is not enough.
-func (d distro) vulkanInstall() installPlan {
+// vulkanInstall installs the Vulkan loader + driver of the bitness this Wine
+// build needs. Installing the 32-bit set on a new-WoW64 Wine is not just wasted:
+// on Arch the lib32 packages require the multilib repo, so the command fails and
+// the player is left thinking the launcher is broken.
+func (d distro) vulkanInstall(a wineArch) installPlan {
 	if d.immutable {
-		return installPlan{manual: true, note: "install a 32-bit Vulkan driver via your image tooling (rpm-ostree/Flatpak runtime)"}
+		return installPlan{manual: true, note: "install a Vulkan driver via your image tooling (rpm-ostree/Flatpak runtime)"}
+	}
+	if !a.needs32() {
+		// New WoW64: the 64-bit loader and driver are what the game actually uses.
+		switch d.family() {
+		case "arch":
+			return installPlan{
+				commands: [][]string{{"sudo", "pacman", "-S", "--needed", "--noconfirm", "vulkan-icd-loader"}},
+				note:     "also install your GPU driver: mesa (AMD/Intel) or nvidia-utils (NVIDIA)",
+			}
+		case "debian":
+			return installPlan{commands: [][]string{
+				{"sudo", "apt-get", "update"},
+				{"sudo", "apt-get", "install", "-y", "libvulkan1", "mesa-vulkan-drivers"},
+			}}
+		case "fedora", "rhel":
+			return installPlan{commands: [][]string{{"sudo", "dnf", "install", "-y", "vulkan-loader", "mesa-vulkan-drivers"}}}
+		case "suse":
+			return installPlan{commands: [][]string{{"sudo", "zypper", "--non-interactive", "install", "libvulkan1"}}}
+		}
+		return installPlan{manual: true, note: "install the Vulkan loader (libvulkan1 / vulkan-icd-loader) and your GPU's Vulkan driver"}
 	}
 	switch d.family() {
 	case "arch":
 		return installPlan{
 			commands: [][]string{{"sudo", "pacman", "-S", "--needed", "--noconfirm", "vulkan-icd-loader", "lib32-vulkan-icd-loader"}},
-			note:     "also install your GPU's 32-bit driver: lib32-mesa (AMD/Intel) or lib32-nvidia-utils (NVIDIA)",
+			note:     "needs the multilib repo enabled; also install your GPU's 32-bit driver: lib32-mesa (AMD/Intel) or lib32-nvidia-utils (NVIDIA)",
 		}
 	case "debian":
 		return installPlan{
@@ -382,17 +527,47 @@ func (d distro) vulkanInstall() installPlan {
 // gstreamerInstall is how we would install the GStreamer codec plugins WC3's
 // intro cinematics need through Wine: the AVI demuxer (plugins-good) plus the
 // libav/ffmpeg video decoders (gst-libav).
-func (d distro) gstreamerInstall() installPlan {
+func (d distro) gstreamerInstall(a wineArch) installPlan {
 	if d.immutable {
-		return installPlan{manual: true, note: "install the GStreamer codec plugins (gst-libav + plugins-good/bad/ugly, including the 32-bit variants for Wine) via your image tooling or a Flatpak runtime"}
+		return installPlan{manual: true, note: "install the GStreamer codec plugins (gst-libav + plugins-good/bad/ugly, matching your Wine's bitness) via your image tooling or a Flatpak runtime"}
+	}
+	if !a.needs32() {
+		// New WoW64: the 32-bit game is served by a 64-bit process, so the 64-bit
+		// plugins are the ones winegstreamer loads. Installing the 32-bit set here
+		// fixes nothing, and on Arch there is no lib32 gst-libav to install at all.
+		switch d.family() {
+		case "arch":
+			return installPlan{commands: [][]string{
+				{"sudo", "pacman", "-S", "--needed", "--noconfirm", "gst-libav", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly"},
+			}}
+		case "debian":
+			return installPlan{commands: [][]string{
+				{"sudo", "apt-get", "update"},
+				{"sudo", "apt-get", "install", "-y",
+					"gstreamer1.0-libav", "gstreamer1.0-plugins-good", "gstreamer1.0-plugins-bad", "gstreamer1.0-plugins-ugly"},
+			}}
+		case "fedora", "rhel":
+			return installPlan{
+				commands: [][]string{{"sudo", "dnf", "install", "-y",
+					"gstreamer1-plugin-libav", "gstreamer1-plugins-good", "gstreamer1-plugins-bad-free", "gstreamer1-plugins-ugly-free"}},
+				note: "if an intro codec is still missing, enable RPM Fusion for the extra freeworld plugins",
+			}
+		case "suse":
+			return installPlan{commands: [][]string{{"sudo", "zypper", "--non-interactive", "install",
+				"gstreamer-plugins-libav", "gstreamer-plugins-good", "gstreamer-plugins-bad", "gstreamer-plugins-ugly"}}}
+		}
+		return installPlan{manual: true, note: "install the GStreamer codec plugins gst-libav + gst-plugins-good/bad/ugly"}
 	}
 	switch d.family() {
 	case "arch":
-		// Arch is pure WoW64: a 32-bit app uses the 64-bit host GStreamer, so the
-		// 64-bit plugins are the ones Wine loads. No lib32 packages needed.
-		return installPlan{commands: [][]string{
-			{"sudo", "pacman", "-S", "--needed", "--noconfirm", "gst-libav", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly"},
-		}}
+		// Classic multilib Wine on Arch: the 32-bit game needs lib32 plugins, which
+		// require the multilib repo.
+		return installPlan{
+			commands: [][]string{
+				{"sudo", "pacman", "-S", "--needed", "--noconfirm", "gst-libav", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly", "lib32-gst-plugins-good", "lib32-gst-plugins-base"},
+			},
+			note: "needs the multilib repo enabled",
+		}
 	case "debian":
 		// Multilib Wine: WC3 is 32-bit, so winegstreamer loads the i386 plugins; a
 		// 32-bit process cannot dlopen a 64-bit .so. Enable i386 and install both

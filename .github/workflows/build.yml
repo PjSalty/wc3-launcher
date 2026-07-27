@@ -39,8 +39,14 @@ jobs:
 
   build:
     needs: check
-    # Only ship binaries on a tag or a default-branch push, never on PRs.
-    if: github.event_name == 'push'
+    # Runs on pull_request too, not only push. This is deliberate: under branch
+    # protection a REQUIRED status check that is skipped stays Pending forever, so
+    # if 'build' skipped on PRs the automated release-sync PR could never merge.
+    # Instead 'build' compiles and reports green on every event, while the
+    # signing / SBOM-attach / release steps below stay gated on refs/tags/v* only
+    # -- so a PR (or a plain main push) builds and reports success but ships
+    # nothing. Keep the job name 'build' so branch-protection required_status_checks
+    # stay wired to it.
     runs-on: ubuntu-latest
     permissions:
       contents: write # attach binaries to a Release on a v* tag

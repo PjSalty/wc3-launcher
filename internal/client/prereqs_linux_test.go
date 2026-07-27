@@ -3,7 +3,9 @@
 package client
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -95,7 +97,7 @@ func TestVulkanInstallPlans(t *testing.T) {
 		"suse":   "libvulkan1-32bit",
 	}
 	for id, pkg := range want {
-		plan := distro{id: id}.vulkanInstall()
+		plan := distro{id: id}.vulkanInstall(wineArchMultilib)
 		var cmds []string
 		for _, c := range plan.commands {
 			cmds = append(cmds, strings.Join(c, " "))
@@ -124,7 +126,7 @@ func TestGstreamerInstallPlans(t *testing.T) {
 		"suse":   {"gstreamer-plugins-libav", "-32bit"},
 	}
 	for id, w := range want {
-		plan := distro{id: id}.gstreamerInstall()
+		plan := distro{id: id}.gstreamerInstall(wineArchMultilib)
 		var cmds []string
 		for _, c := range plan.commands {
 			cmds = append(cmds, strings.Join(c, " "))
@@ -139,12 +141,12 @@ func TestGstreamerInstallPlans(t *testing.T) {
 	}
 
 	// The retired RPM Fusion name must NOT come back on fedora.
-	if joined := planCmds(distro{id: "fedora"}.gstreamerInstall()); strings.Contains(joined, "gstreamer1-libav ") || strings.Contains(joined, "gstreamer1-libav.") {
+	if joined := planCmds(distro{id: "fedora"}.gstreamerInstall(wineArchMultilib)); strings.Contains(joined, "gstreamer1-libav ") || strings.Contains(joined, "gstreamer1-libav.") {
 		t.Errorf("fedora plan uses the retired gstreamer1-libav name: %q", joined)
 	}
 
 	// An immutable distro must NOT be auto-run (no editing the base image).
-	pb := distro{id: "bazzite", like: "fedora", immutable: true}.gstreamerInstall()
+	pb := distro{id: "bazzite", like: "fedora", immutable: true}.gstreamerInstall(wineArchMultilib)
 	if !pb.manual {
 		t.Error("immutable distro gstreamer plan must be manual (not auto-run)")
 	}
@@ -167,13 +169,88 @@ func TestEnsurePrereqsNoOpWhenPresent(t *testing.T) {
 	if _, err := exec.LookPath("wine"); err != nil {
 		t.Skip("wine not present; nothing to verify without installing")
 	}
-	if !hasVulkan32() {
-		t.Skip("32-bit vulkan loader not present; would prompt to install")
+	if !hasVulkanForWine(detectWineArch()) {
+		t.Skip("vulkan loader for this wine build not present; would prompt to install")
 	}
-	if !detectDistro().hasGstreamerCodecs() {
+	if !detectDistro().hasGstreamerCodecs(detectWineArch()) {
 		t.Skip("gstreamer codecs not present; would prompt to install")
 	}
 	if err := EnsurePrereqs(); err != nil {
 		t.Fatalf("EnsurePrereqs errored on a host with wine + vulkan + gstreamer present: %v", err)
+	}
+}
+
+// TestWineArchFromRoots pins the bitness decision to the Wine build layout, which
+// is the whole point of the fix: an i386-unix loader means a 32-bit game runs as a
+// 32-bit process (needs 32-bit host libs), while an x86_64-unix-only tree is new
+// WoW64 (needs 64-bit host libs). Getting this backwards is what made the launcher
+// demand packages that do not exist on the player's distro.
+func TestWineArchFromRoots(t *testing.T) {
+	mk := func(t *testing.T, arches ...string) string {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), "wine")
+		for _, a := range arches {
+			if err := os.MkdirAll(filepath.Join(root, a), 0o755); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+		}
+		return root
+	}
+
+	if got := wineArchFromRoots([]string{mk(t, "i386-unix", "x86_64-unix")}); got != wineArchMultilib {
+		t.Fatalf("classic WoW64 (i386-unix present) = %v, want multilib", got)
+	}
+	if got := wineArchFromRoots([]string{mk(t, "x86_64-unix", "i386-windows")}); got != wineArchNewWoW64 {
+		t.Fatalf("new WoW64 (no i386-unix) = %v, want newWoW64", got)
+	}
+	if got := wineArchFromRoots([]string{filepath.Join(t.TempDir(), "absent")}); got != wineArchUnknown {
+		t.Fatalf("no wine tree = %v, want unknown", got)
+	}
+	// Unknown must probe both bitnesses rather than silently skip the real fix.
+	if len(vulkanLoaderPaths(wineArchUnknown)) <= len(vulkanLoaderPaths(wineArchMultilib)) {
+		t.Fatal("unknown arch must check at least as many vulkan paths as a known one")
+	}
+	if !wineArchMultilib.needs32() || wineArchNewWoW64.needs32() {
+		t.Fatal("needs32 is inverted")
+	}
+}
+
+// TestGstreamerDirsFollowWineNotDistro proves the same distro resolves to
+// different plugin dirs depending on the Wine build. Debian with a new-WoW64 Wine
+// must look at the x86_64 multiarch dir, not the i386 one.
+func TestGstreamerDirsFollowWineNotDistro(t *testing.T) {
+	deb := distro{id: "debian"}
+	m32 := deb.gstreamerPluginDirs(wineArchMultilib)
+	m64 := deb.gstreamerPluginDirs(wineArchNewWoW64)
+	if len(m32) == 0 || m32[0] != "/usr/lib/i386-linux-gnu/gstreamer-1.0" {
+		t.Fatalf("debian multilib dirs = %v, want the i386 multiarch dir", m32)
+	}
+	if len(m64) == 0 || m64[0] != "/usr/lib/x86_64-linux-gnu/gstreamer-1.0" {
+		t.Fatalf("debian new-WoW64 dirs = %v, want the x86_64 multiarch dir", m64)
+	}
+	// Arch inverts the layout: /usr/lib is 64-bit there, lib32 is the 32-bit tree.
+	arch := distro{id: "arch"}
+	if got := arch.gstreamerPluginDirs(wineArchNewWoW64); got[0] != "/usr/lib/gstreamer-1.0" {
+		t.Fatalf("arch new-WoW64 dirs = %v, want /usr/lib/gstreamer-1.0", got)
+	}
+	if got := arch.gstreamerPluginDirs(wineArchMultilib); got[0] != "/usr/lib32/gstreamer-1.0" {
+		t.Fatalf("arch multilib dirs = %v, want /usr/lib32/gstreamer-1.0", got)
+	}
+}
+
+// TestNewWoW64PlansAvoid32BitPackages guards the player-facing failure: telling an
+// Arch/CachyOS user to install lib32 packages that need the multilib repo makes the
+// command fail and reads as "the launcher is broken".
+func TestNewWoW64PlansAvoid32BitPackages(t *testing.T) {
+	for _, id := range []string{"arch", "debian", "fedora", "suse"} {
+		d := distro{id: id}
+		for _, plan := range []installPlan{d.vulkanInstall(wineArchNewWoW64), d.gstreamerInstall(wineArchNewWoW64)} {
+			line := plan.cmdline()
+			for _, bad := range []string{"lib32-", ":i386", ".i686", "-32bit", "--add-architecture"} {
+				if strings.Contains(line, bad) {
+					t.Fatalf("%s new-WoW64 plan contains 32-bit token %q: %s", id, bad, line)
+				}
+			}
+		}
 	}
 }
