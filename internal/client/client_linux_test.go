@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"wc3-launcher/internal/wineenv"
 )
 
 // TestRuntimeDirEnv covers the Bazzite failure: a session with no usable
@@ -20,7 +21,7 @@ func TestRuntimeDirEnv(t *testing.T) {
 	// A valid value is left completely alone.
 	good := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", good)
-	if got := runtimeDirEnv(); got != nil {
+	if got := wineenv.RuntimeDirEnv(); got != nil {
 		t.Fatalf("a valid XDG_RUNTIME_DIR must not be overridden, got %v", got)
 	}
 
@@ -28,7 +29,7 @@ func TestRuntimeDirEnv(t *testing.T) {
 	// (only assertable where the standard runtime dir actually exists).
 	for _, bad := range []string{"", "/nonexistent/xdg/runtime"} {
 		t.Setenv("XDG_RUNTIME_DIR", bad)
-		got := runtimeDirEnv()
+		got := wineenv.RuntimeDirEnv()
 		if haveReal == nil {
 			if len(got) != 1 || got[0] != "XDG_RUNTIME_DIR="+real {
 				t.Fatalf("XDG_RUNTIME_DIR=%q should be repaired to %s, got %v", bad, real, got)
