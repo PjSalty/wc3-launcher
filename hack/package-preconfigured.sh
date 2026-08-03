@@ -79,10 +79,28 @@ package() {
   python3 -c '
 import sys, zipfile
 out, binp, binn, jsonp, readme = sys.argv[1:6]
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    z.write(binp, binn)
-    z.write(jsonp, "wc3-launcher.json")
-    z.write(readme, "README.txt")
+
+def add(z, arcname, data, mode):
+    # zipfile.write() copies the SOURCE file mode into the archive, and curl
+    # writes 0644, so the extracted Linux binary was not executable and the
+    # README instruction "./wc3-launcher" failed for every player. Set the mode
+    # explicitly instead of inheriting whatever the download happened to have.
+    zi = zipfile.ZipInfo(arcname)
+    zi.external_attr = (mode & 0o7777) << 16
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    z.writestr(zi, data)
+
+with open(binp, "rb") as f:
+    binary = f.read()
+with open(jsonp, "rb") as f:
+    cfg = f.read()
+with open(readme, "rb") as f:
+    rdm = f.read()
+
+with zipfile.ZipFile(out, "w") as z:
+    add(z, binn, binary, 0o755)
+    add(z, "wc3-launcher.json", cfg, 0o644)
+    add(z, "README.txt", rdm, 0o644)
 ' "$zip" "$work/$bin" "$bin" "$work/wc3-launcher.json" "$work/README.txt"
   echo "  built ${zip#"$OUT_ABS"/}  ($(du -h "$zip" | cut -f1))"
 }

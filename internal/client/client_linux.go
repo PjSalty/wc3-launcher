@@ -15,8 +15,33 @@ import (
 // launcher never touches the user's default ~/.wine.
 func winePrefix(dir string) string { return filepath.Join(dir, "wineprefix") }
 
+// runtimeDirEnv returns an XDG_RUNTIME_DIR override when the session does not
+// provide a usable one.
+//
+// Wine's Wayland and D-Bus paths require it, and a session that lacks it fails
+// with "XDG_RUNTIME_DIR is invalid or not set in the environment" - which is
+// what a fresh Bazzite box hit, taking the Blizzard installer down with it
+// (exit status 1). It is missing more often than you would expect: a bare TTY,
+// a terminal started outside a logind user session, some immutable-distro and
+// container shells. The standard location is /run/user/<uid>, so use that when
+// the variable is absent or does not point at a real directory. Returns nothing
+// when the session is already correct or the fallback does not exist, so a
+// working setup is never overridden.
+func runtimeDirEnv() []string {
+	if p := os.Getenv("XDG_RUNTIME_DIR"); p != "" {
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			return nil
+		}
+	}
+	fallback := fmt.Sprintf("/run/user/%d", os.Getuid())
+	if fi, err := os.Stat(fallback); err == nil && fi.IsDir() {
+		return []string{"XDG_RUNTIME_DIR=" + fallback}
+	}
+	return nil
+}
+
 func wineEnv(dir string) []string {
-	return append(os.Environ(),
+	return append(append(os.Environ(), runtimeDirEnv()...),
 		"WINEPREFIX="+winePrefix(dir),
 		"WINEDEBUG=-all",
 		// Route WC3's Direct3D 8 through the bundled d3d8to9 -> DXVK (d3d9) ->
