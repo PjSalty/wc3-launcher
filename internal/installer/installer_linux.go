@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"wc3-launcher/internal/wineenv"
 )
 
 // winePrefix mirrors the client package: a dedicated prefix inside the game
@@ -50,8 +51,18 @@ func Run(dir, installerPath string) error {
 	if err != nil {
 		return fmt.Errorf("Wine is required to install Warcraft III on Linux; install it (for example `sudo apt install wine`) and re-run")
 	}
+	// Refuse before spending a download and a Wine prefix on something that
+	// cannot work. Without this the installer dies inside Wine with a bare
+	// "exit status 1" and the player has no idea why.
+	if !wineenv.HasDisplay() {
+		return fmt.Errorf("no graphical display available\n\n%s", wineenv.NoDisplayHelp)
+	}
 	cmd := exec.Command(wine, installerPath)
-	cmd.Env = append(os.Environ(), "WINEPREFIX="+winePrefix(dir), "WINEDEBUG=-all")
+	// RuntimeDirEnv is the SHARED repair, not a local copy. This path used to
+	// build its own environment, which is why the v1.3.9 XDG_RUNTIME_DIR fix
+	// reached the game but never the installer.
+	cmd.Env = append(append(os.Environ(), wineenv.RuntimeDirEnv()...),
+		"WINEPREFIX="+winePrefix(dir), "WINEDEBUG=-all")
 	logPath := filepath.Join(dir, "wine.log")
 	if lf := wineLog(dir); lf != nil {
 		defer lf.Close()
