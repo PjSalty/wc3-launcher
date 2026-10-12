@@ -45,8 +45,9 @@ func main() {
 			os.Exit(0)
 		}
 		if errors.Is(err, errAlreadyRunning) {
-			fmt.Println("\nThe launcher is already running in another window.")
-			fmt.Println("Close that window first, or just switch to it - you are already connected there.")
+			fmt.Println("\nPort 6112 on this computer is already in use, so the launcher cannot start its local gateway.")
+			fmt.Println("Usually that means the launcher is already running in another window: close that window first,")
+			fmt.Println("or just switch to it - you are already connected there. If it is not, another program is using the port.")
 			fmt.Println("\nPress Enter to close.")
 			_, _ = fmt.Scanln()
 			os.Exit(0)
@@ -59,6 +60,16 @@ func main() {
 }
 
 func run() error {
+	// Accept `wc3-launcher doctor` as a subcommand as well as --doctor: a bare
+	// word is what someone types when told "run the doctor". Flag parsing stops
+	// at the first non-flag argument, so the word is removed here, BEFORE
+	// flag.Parse, which keeps `doctor --server x` working.
+	doctorSub := false
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		doctorSub = true
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
+
 	// Relay-host is the DEFAULT: just running the launcher makes you able to
 	// Create Game and be joined, no flag and no router setup. --direct forces a
 	// plain realm connection (join-only) and is only for debugging.
@@ -68,6 +79,7 @@ func run() error {
 	tokenFlag := flag.String("token", "", "relay auth token (also WC3_RELAY_TOKEN env, or wc3-launcher.json)")
 	certPinFlag := flag.String("cert-pin", "", "base64 SHA-256 of the relay cert SPKI (also WC3_RELAY_CERT_PIN env, or wc3-launcher.json)")
 	gatewayFlag := flag.String("gateway", "", "realm display name in the WC3 gateway list (also WC3_GATEWAY env, or wc3-launcher.json)")
+	doctorFlag := flag.Bool("doctor", false, "print a diagnostic report and exit; read-only, and safe to run when the launcher will not start")
 	flag.Parse()
 
 	if *showVersion {
@@ -79,6 +91,14 @@ func run() error {
 	// serverHost, relayToken, relayCertPin, so a stock binary can point at any
 	// server without a rebuild. Nothing set falls back to the compiled-in value.
 	resolveConnection(*serverFlag, *tokenFlag, *certPinFlag, *gatewayFlag)
+
+	// The doctor runs here on purpose: after config resolution, so it reports the
+	// settings that would really be used, but BEFORE seedPerUserConfig, which
+	// writes a file. A diagnostic that changes state on the machine it is
+	// diagnosing is not a diagnostic.
+	if doctorSub || *doctorFlag {
+		return runDoctor()
+	}
 
 	// Persist a preconfigured build's settings (server + token + cert pin) to the
 	// per-user config on first run, so the desktop shortcut - which points at a
@@ -206,13 +226,20 @@ func run() error {
 	//    connection so play/joining still works.
 	if !*directMode {
 		err := connectViaRelay(dir, gameRoot)
-		if err == nil {
+		switch {
+		case err == nil:
 			return nil
-		}
-		if !errors.Is(err, errRelayUnreachable) {
+		case errors.Is(err, errRelayTokenRefused):
+			fmt.Println("The host relay did not accept this launcher's access token, so hosting is off.")
+			fmt.Println("You can still play and join games. Ask whoever runs the server for the current launcher download.")
+		case errors.Is(err, relaylink.ErrBadPort):
+			fmt.Printf("Hosting is off for this session: %v.\n", err)
+			fmt.Println("You can still play and join games.")
+		case errors.Is(err, errRelayUnreachable):
+			fmt.Println("Host relay is unavailable right now - connecting directly. You can still play and join games.")
+		default:
 			return err
 		}
-		fmt.Println("Host relay is unavailable right now - connecting directly. You can still play and join games.")
 	}
 
 	fmt.Printf("Configuring connection to %q...\n", gatewayName)
@@ -235,9 +262,14 @@ func run() error {
 // fall back to a direct realm connection.
 var errRelayUnreachable = errors.New("relay unreachable")
 
-// errAlreadyRunning signals another launcher instance already owns the local
-// gateway port, so this one exits with a friendly message rather than launch a
-// second game that cannot connect.
+// errRelayTokenRefused signals the relay is there and is who it claims to be,
+// but turned this launcher's token down. Joining still works without the relay,
+// so run() falls back too, and says why hosting is off.
+var errRelayTokenRefused = errors.New("relay refused the token")
+
+// errAlreadyRunning signals the local gateway port is taken, almost always by
+// another launcher instance, so this one exits with a friendly message rather
+// than launch a second game that cannot connect.
 var errAlreadyRunning = errors.New("launcher already running")
 
 // errCancelled means the player deliberately backed out (Ctrl-C at a prompt). It
@@ -268,7 +300,10 @@ func connectViaRelay(dir, gameRoot string) error {
 	link, port, err := relaylink.Dial(ctx, relayAddr, relayToken, hostGamePort, logger, relayTLSConfig(serverHost))
 	if err != nil {
 		gateLn.Close()
-		return fmt.Errorf("%w: %v", errRelayUnreachable, err)
+		if ctx.Err() != nil {
+			return errCancelled
+		}
+		return classifyRelayError(err)
 	}
 	fmt.Printf("Connected (relay port %d). You can Create Game and friends can join, no setup on anyone's end.\n", port)
 
@@ -315,9 +350,35 @@ func connectViaRelay(dir, gameRoot string) error {
 	}()
 	fmt.Println("You are ready to host. Keep this window open while you play; it closes on its own when you quit the game.")
 	if err := relaylink.ServeHost(ctx, link, gateLn, logger); err != nil && ctx.Err() == nil {
+		if errors.Is(err, relaylink.ErrTunnelLost) {
+			return errors.New("the connection to the host relay was lost, which disconnected Warcraft III from the server. Start the launcher again to reconnect")
+		}
 		return fmt.Errorf("host relay: %w", err)
 	}
 	return nil
+}
+
+// classifyRelayError turns a failed relay dial into what run() should do about
+// it. "Could not reach it", "it refused the token" and "it named a game port this
+// computer cannot use" fall back to a direct connection, each with its own
+// message. A rejected certificate never does: that is either a server whose
+// certificate changed or something in the path answering for it, and quietly
+// carrying on over the unencrypted direct connection would hide which.
+func classifyRelayError(err error) error {
+	var refused *relaylink.RefusedError
+	switch {
+	case errors.Is(err, relaylink.ErrUntrusted):
+		return fmt.Errorf("the host relay at %s did not present the certificate this launcher trusts, so nothing was sent to it. "+
+			"Either the server's certificate changed (ask whoever runs it for the current launcher download) "+
+			"or something between you and the server is answering in its place. "+
+			"To play without the relay anyway, start the launcher with --direct (%v)", serverHost, err)
+	case errors.Is(err, relaylink.ErrBadPort):
+		return err // the tunnel was refused, so nothing is bridged; direct play is unaffected
+	case errors.As(err, &refused) && refused.Reason == "unauthorized":
+		return fmt.Errorf("%w: %v", errRelayTokenRefused, err)
+	default:
+		return fmt.Errorf("%w: %v", errRelayUnreachable, err)
+	}
 }
 
 // relayTLSConfig builds the launcher's TLS config for the relay tunnel. When
@@ -331,11 +392,11 @@ func relayTLSConfig(host string) *tls.Config {
 		cfg.InsecureSkipVerify = true // verified by pin below, not by CA chain
 		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
-				return errors.New("relay presented no certificate")
+				return fmt.Errorf("%w: no certificate presented", relaylink.ErrUntrusted)
 			}
 			sum := sha256.Sum256(cs.PeerCertificates[0].RawSubjectPublicKeyInfo)
 			if base64.StdEncoding.EncodeToString(sum[:]) != relayCertPin {
-				return errors.New("relay certificate pin mismatch")
+				return fmt.Errorf("%w: it does not match the pinned key", relaylink.ErrUntrusted)
 			}
 			return nil
 		}
@@ -373,8 +434,12 @@ func chooseClassic(parent context.Context) (bool, error) {
 	}
 	// Buffered so this goroutine cannot leak if we return on cancellation first.
 	ch := make(chan answer, 1)
+	// Bind stdin here, not inside the goroutine. A cancelled prompt leaves its
+	// reader goroutine behind, and one that looked os.Stdin up late would read
+	// whatever stdin is by then and swallow the next prompt's answer.
+	in := bufio.NewReader(os.Stdin)
 	go func() {
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, err := in.ReadString('\n')
 		ch <- answer{line, err}
 	}()
 

@@ -153,8 +153,8 @@ client from a plaintext one by peeking a single byte (`Server.wrapTLS`): `0x16` 
 a TLS handshake record, `0xF9` is a plaintext tunnel frame. A `prefixConn` re-serves
 that peeked byte so neither the TLS handshake nor the first frame loses it. The
 launcher always speaks TLS (`relaylink.Dial` uses `tls.Dialer`, no plaintext path);
-the plaintext branch on the server exists only as a rollout bridge and is refused
-outright once `-require-tls` is set.
+the plaintext branch on the server is refused unless it is turned on by name with
+`RELAY_REQUIRE_TLS=0`.
 
 **Backpressure.** Each stream has a bounded queue on both ends (`inboxCap` /
 `connOutCap`, 512 chunks). If a consumer falls that far behind, e.g. a joiner on
@@ -169,28 +169,39 @@ The tunnel port faces the internet, so the relay is built to survive hostile inp
 before a session proves anything (`internal/relay/server.go`, `session.go`):
 
 - **TLS only.** The tunnel carries the realm session end to end, so it's encrypted.
-  The relay terminates TLS (`wrapTLS`); with `-require-tls` there's no plaintext
-  path. The launcher pins the relay's certificate by its SubjectPublicKeyInfo
+  The relay terminates TLS (`wrapTLS`) and has no plaintext path unless
+  `RELAY_REQUIRE_TLS=0` asks for one; without a certificate it refuses to start.
+  The launcher pins the relay's certificate by its SubjectPublicKeyInfo
   SHA-256 (`relayTLSConfig` in `main.go`), so a self-signed cert is enough and no
   public CA is trusted. The pin is public information and safe to ship in the
   binary.
 - **Shared token gate.** The launcher presents a token in HELLO
   (`Session.Run`). It gates "must be our launcher", not per-user identity, PvPGN's
-  account login is the real play-access auth. `-require-auth` rejects a bad or
-  absent token; the relay refuses to start with `-require-auth` and no token, since
-  that would reject every launcher and take the realm down.
-- **Session caps, independent of auth.** Per-IP (4) and global (80) session caps
-  (`Server.admit`) apply *before* HELLO, so an attacker who never sends a valid
-  token still can't make the relay allocate ports or FDs without bound. Auth
-  decides who gets in; the caps decide how much anyone can take.
+  account login is the real play-access auth. A bad or absent token is rejected.
+  The gate is on by default and the relay refuses to start without a token, so a
+  deployment that forgets one fails loudly instead of running open;
+  `RELAY_REQUIRE_AUTH=0` turns the gate off on purpose.
+- **Session caps, independent of auth.** Per-source (4) and global (80) session
+  caps (`Server.admit`) apply *before* HELLO, so an attacker who never sends a
+  valid token still can't make the relay allocate ports or FDs without bound. A
+  source is an IPv4 address or an IPv6 /64 (`capKey`), since one IPv6 host owns a
+  whole /64. Auth decides who gets in; the caps decide how much anyone can take.
 - **Per-game caps.** 32 joiners per game (a real lobby is <=24) and 16
   launcher-opened streams per session (`maxJoinersPerGame`, `maxClientStreams`), so
   a flood on a public port or a malicious tunnel can't exhaust host-side dials.
+  The launcher may only open odd stream ids that are free (`launcherMayOpen`); an
+  OPEN on an even or live id ends the session, so the cap can't be sidestepped by
+  picking ids from the joiner half.
 - **Timeouts.** One absolute pre-HELLO budget covers the peek, the TLS handshake,
   and the HELLO frame (`helloTimeout`, 10s), so a slowloris gets that total, not
   per step. After HELLO a rolling idle deadline (`idleTimeout`, 180s, re-armed per
   frame) tears down a tunnel that goes silent so it can't sit on a pool port
-  forever.
+  forever. Writes are bounded too (`tunWriteTimeout`, `streamWriteTimeout`): a
+  host that stops reading its tunnel would otherwise block a writer with the send
+  mutex held and never reach the idle deadline.
+- **Panics stay in their session.** Every goroutine a session starts runs under
+  `Session.contain`, which logs a panic and tears that one session down; the
+  accept loop has the same guard. One bad session can't take the daemon down.
 - **Bounded queues.** The per-stream outbound queues above also mean a stalled peer
   can't consume unbounded memory.
 

@@ -36,6 +36,13 @@ const (
 	// connOutCap bounds each stream's outbound queue. Deep enough for normal WC3
 	// bursts, shallow enough that a stalled peer is dropped quickly.
 	connOutCap = 512
+	// tunWriteTimeout bounds one frame write to the host's tunnel. Every stream
+	// shares that socket behind sendMu, so a host that stops reading would hold
+	// the first blocked writer, the mutex, and with it the PONG that lets the read
+	// loop get back to its idle deadline: the port and slot would never be freed.
+	tunWriteTimeout = 20 * time.Second
+	// streamWriteTimeout is the same bound for one pvpgn or joiner socket.
+	streamWriteTimeout = 30 * time.Second
 )
 
 // relayConn is one stream's socket plus a bounded outbound queue. Writes from the
@@ -49,17 +56,24 @@ type relayConn struct {
 	closeOnce sync.Once
 }
 
-func newRelayConn(c net.Conn) *relayConn {
+// newRelayConn wraps c and starts its writer under run, the owning session's
+// panic boundary (see Session.contain).
+func newRelayConn(c net.Conn, run func(what string, fn func())) *relayConn {
 	rc := &relayConn{Conn: c, out: make(chan []byte, connOutCap), closed: make(chan struct{})}
-	go rc.pumpOut()
+	go run("stream writer", rc.pumpOut)
 	return rc
 }
 
-// pumpOut drains the queue to the socket; a write error kills just this stream.
+// pumpOut drains the queue to the socket; a write error or a write that does not
+// finish in time kills just this stream.
 func (rc *relayConn) pumpOut() {
 	for {
 		select {
 		case b := <-rc.out:
+			if err := rc.Conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil {
+				rc.shutdown()
+				return
+			}
 			if _, err := rc.Conn.Write(b); err != nil {
 				rc.shutdown()
 				return
@@ -111,11 +125,15 @@ type Session struct {
 	port  uint16
 	pubLn net.Listener
 
-	sendMu sync.Mutex // serializes frame writes onto the shared tunnel
+	sendMu       sync.Mutex    // serializes frame writes onto the shared tunnel
+	writeTimeout time.Duration // per-frame tunnel write bound; 0 means tunWriteTimeout
 
 	mu         sync.Mutex
 	conns      map[uint16]*relayConn // live streams: odd = pvpgn dials, even = joiners
 	nextJoiner uint16                // next even joiner stream id
+	done       bool                  // torn down: no stream may be added any more
+
+	cancel context.CancelFunc // ends the session; set in Run before any goroutine starts
 }
 
 func (s *Session) logf(format string, args ...any) {
@@ -124,12 +142,41 @@ func (s *Session) logf(format string, args ...any) {
 	}
 }
 
+// contain runs fn and keeps a panic inside this session: it is logged, the
+// session is torn down, and every other session carries on. Every goroutine a
+// session starts runs under it, because a panic in any goroutine ends the process.
+func (s *Session) contain(what string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logf("session port %d: %s panicked, recovered: %v", s.port, what, r)
+			if s.cancel != nil {
+				s.cancel()
+			}
+		}
+	}()
+	fn()
+}
+
 // send writes one frame to the tunnel; the mutex keeps concurrent producers
-// (every stream's pump) from interleaving on the wire.
+// (every stream's pump) from interleaving on the wire. The write is bounded, and
+// a failed one closes the tunnel: it leaves a partial frame on the wire, so the
+// stream is desynced, and closing is what unblocks the read loop to end the
+// session and free its port.
 func (s *Session) send(f tunnel.Frame) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	return tunnel.WriteFrame(s.tun, f)
+	wt := s.writeTimeout
+	if wt == 0 {
+		wt = tunWriteTimeout
+	}
+	err := s.tun.SetWriteDeadline(time.Now().Add(wt))
+	if err == nil {
+		err = tunnel.WriteFrame(s.tun, f)
+	}
+	if err != nil {
+		_ = s.tun.Close()
+	}
+	return err
 }
 
 // sendData chunks b into DATA frames within the frame-size cap.
@@ -212,18 +259,19 @@ func (s *Session) Run(ctx context.Context) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	s.cancel = cancel
 	// Cancelling closes the sockets so blocked reads/accepts unblock.
-	go func() {
+	go s.contain("teardown", func() {
 		<-ctx.Done()
 		_ = ln.Close()
 		_ = s.tun.Close()
 		s.closeAllConns()
-	}()
+	})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); defer cancel(); s.readTunnel(ctx) }()
-	go func() { defer wg.Done(); defer cancel(); s.acceptJoiners() }()
+	go func() { defer wg.Done(); defer cancel(); s.contain("tunnel reader", func() { s.readTunnel(ctx) }) }()
+	go func() { defer wg.Done(); defer cancel(); s.contain("joiner accept", s.acceptJoiners) }()
 	wg.Wait()
 	s.logf("session down: port %d", port)
 	return nil
@@ -243,6 +291,14 @@ func (s *Session) readTunnel(ctx context.Context) {
 		}
 		switch f.Type {
 		case tunnel.TypeOpen:
+			// The launcher may open odd ids only, and only free ones. An even id
+			// would land in the joiner half of the map, outside the client cap, and
+			// a live id would orphan the stream already on it. A real launcher
+			// sends neither, so the session ends here.
+			if !s.launcherMayOpen(f.Stream) {
+				s.logf("session port %d: OPEN on stream %d is not the launcher's to open, ending session", s.port, f.Stream)
+				return
+			}
 			// Dial synchronously so conns[id] exists before this stream's DATA
 			// frames (which follow immediately in the ordered tunnel) arrive.
 			s.openPvpgn(ctx, f.Stream)
@@ -263,6 +319,31 @@ func (s *Session) readTunnel(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// launcherMayOpen reports whether id is one the launcher is allowed to open: an
+// odd id with no live stream on it.
+func (s *Session) launcherMayOpen(id uint16) bool {
+	if id%2 == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, live := s.conns[id]
+	return !live
+}
+
+// addConn registers a stream, unless the session is already torn down, in which
+// case nothing would ever close it: a dial that outlives the session must not
+// leave its socket behind.
+func (s *Session) addConn(id uint16, rc *relayConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done {
+		return false
+	}
+	s.conns[id] = rc
+	return true
 }
 
 // openPvpgn dials pvpgn for a launcher-opened WC3 connection. The source port is
@@ -300,12 +381,13 @@ func (s *Session) openPvpgn(ctx context.Context, id uint16) {
 		_ = s.send(tunnel.Frame{Type: tunnel.TypeClose, Stream: id})
 		return
 	}
-	rc := newRelayConn(conn)
-	s.mu.Lock()
-	s.conns[id] = rc
-	s.mu.Unlock()
+	rc := newRelayConn(conn, s.contain)
+	if !s.addConn(id, rc) {
+		rc.shutdown()
+		return
+	}
 	s.logf("stream %d -> pvpgn %s", id, s.pvpgn)
-	go s.pump(id, rc)
+	go s.contain("stream pump", func() { s.pump(id, rc) })
 }
 
 // acceptJoiners assigns an even stream to each inbound joiner, tells the host via
@@ -317,6 +399,11 @@ func (s *Session) acceptJoiners() {
 			return
 		}
 		s.mu.Lock()
+		if s.done {
+			s.mu.Unlock()
+			_ = jc.Close()
+			return
+		}
 		// Cap concurrent joiners: a real WC3 lobby is <=24, so refusing past the
 		// cap stops a flood on the public port from exhausting host-side FDs while
 		// never turning away a legitimate joiner.
@@ -347,15 +434,15 @@ func (s *Session) acceptJoiners() {
 			id += 2
 		}
 		s.nextJoiner = id + 2
-		rc := newRelayConn(jc)
+		rc := newRelayConn(jc, s.contain)
 		s.conns[id] = rc
 		s.mu.Unlock()
 		if err := s.send(tunnel.Frame{Type: tunnel.TypeOpen, Stream: id}); err != nil {
-			jc.Close()
+			s.closeConn(id)
 			return
 		}
 		s.logf("joiner %s -> stream %d on port %d", jc.RemoteAddr(), id, s.port)
-		go s.pump(id, rc)
+		go s.contain("stream pump", func() { s.pump(id, rc) })
 	}
 }
 
@@ -390,6 +477,7 @@ func (s *Session) closeConn(id uint16) {
 
 func (s *Session) closeAllConns() {
 	s.mu.Lock()
+	s.done = true
 	all := make([]*relayConn, 0, len(s.conns))
 	for id, c := range s.conns {
 		all = append(all, c)

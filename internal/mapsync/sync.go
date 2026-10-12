@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"wc3-launcher/internal/maplib"
@@ -79,9 +80,17 @@ func (p *progressReader) Read(b []byte) (int, error) {
 // or updated maps new, versioned names, so this never blocks getting new maps.
 // tlsConf pins the server certificate when the build has a pin; nil uses defaults.
 func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, logger *log.Logger, reporter Reporter) (int, error) {
+	// The manifest is trusted because of the channel it arrives on, so that
+	// channel has to be the pinned TLS one for every request. A plain http base
+	// URL has no such channel, and a redirect would leave it: to plain http, to
+	// another host, or to a service on this machine.
+	if u, err := url.Parse(baseURL); err != nil || u.Scheme != "https" || u.Host == "" {
+		return 0, fmt.Errorf("map server URL %q is not https", baseURL)
+	}
 	client := &http.Client{
-		Timeout:   10 * time.Minute,
-		Transport: &http.Transport{TLSClientConfig: tlsConf},
+		Timeout:       10 * time.Minute,
+		Transport:     &http.Transport{TLSClientConfig: tlsConf},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
 	man, err := fetchManifest(ctx, client, baseURL)
@@ -102,6 +111,13 @@ func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, log
 	}
 	var plan []planItem
 	var planBytes int64
+	// Names already taken, compared without case. WC3 and Windows do not tell
+	// DotA.w3x from dota.w3x, so on a case-sensitive disk a second spelling would
+	// sit beside the player's map and shadow it.
+	have, err := namesIn(mapsDir)
+	if err != nil {
+		return 0, fmt.Errorf("reading maps folder: %w", err)
+	}
 	for _, e := range man.Maps {
 		if len(plan) >= maxSyncMaps || planBytes >= maxSyncBytes {
 			logger.Printf("map sync budget reached (%d maps, %d bytes); stopping", len(plan), planBytes)
@@ -112,9 +128,16 @@ func Sync(ctx context.Context, baseURL, mapsDir string, tlsConf *tls.Config, log
 			logger.Printf("skipping map with unsafe name %q", e.Name)
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(mapsDir, name)); err == nil {
+		if have[strings.ToLower(name)] {
 			continue // already have a map by this name - never overwrite it
 		}
+		// The size feeds the plan and its budget, and the hash is what the
+		// download is held to, so neither is taken on trust from the manifest.
+		if e.Size <= 0 || e.Size > maplib.MaxMapSize || !isSHA256Hex(e.SHA256) {
+			logger.Printf("skipping %s: the manifest entry is malformed", name)
+			continue
+		}
+		have[strings.ToLower(name)] = true
 		plan = append(plan, planItem{name: name, e: e})
 		planBytes += e.Size
 	}
@@ -202,6 +225,9 @@ func downloadOne(ctx context.Context, c *http.Client, baseURL, dest, name string
 	if int64(len(body)) > maplib.MaxMapSize {
 		return 0, fmt.Errorf("larger than %d bytes", maplib.MaxMapSize)
 	}
+	if int64(len(body)) != e.Size {
+		return 0, fmt.Errorf("size %d does not match the manifest's %d", len(body), e.Size)
+	}
 	// The SHA-256 proves the download matches what the manifest listed; the trust
 	// anchor is the pinned TLS channel that delivered the manifest, not this hash.
 	sum := sha256.Sum256(body)
@@ -215,6 +241,27 @@ func downloadOne(ctx context.Context, c *http.Client, baseURL, dest, name string
 		return 0, err
 	}
 	return int64(len(body)), nil
+}
+
+// namesIn returns the lowercased names of everything in dir.
+func namesIn(dir string) (map[string]bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		names[strings.ToLower(e.Name())] = true
+	}
+	return names, nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // writeNew publishes data as dest atomically and never overwrites an existing

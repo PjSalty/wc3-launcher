@@ -37,3 +37,17 @@ func TestGatewayStrings(t *testing.T) {
 		}
 	}
 }
+
+// In relay mode the launcher writes 127.0.0.1 as the gateway host, because WC3
+// talks to the local gateway. Migration used to adopt that as "the server" and
+// save it for good.
+func TestParseGatewayNeverAdoptsThisMachine(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "127.0.0.53", "localhost", "LOCALHOST", "::1"} {
+		if _, _, ok := parseGateway([]string{"1001", "0", host, "-6", "PvPGN"}); ok {
+			t.Errorf("parseGateway adopted %q as a server to migrate", host)
+		}
+	}
+	if h, n, ok := parseGateway([]string{"1001", "0", "realm.example.net", "-6", "MyRealm"}); !ok || h != "realm.example.net" || n != "MyRealm" {
+		t.Errorf("a real server must still migrate, got %q/%q/%v", h, n, ok)
+	}
+}

@@ -11,8 +11,11 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -27,9 +30,15 @@ import (
 func main() {
 	dir := flag.String("dir", "/maps", "directory of curated .w3x/.w3m maps to serve")
 	addr := flag.String("addr", ":7443", "listen address")
-	cert := flag.String("cert", "", "TLS certificate file (enables HTTPS; recommended)")
+	cert := flag.String("cert", "", "TLS certificate file")
 	key := flag.String("key", "", "TLS key file")
+	insecure := flag.Bool("insecure-http", false, "serve plain HTTP with no certificate; launchers only sync over HTTPS, so this is for a local test")
 	flag.Parse()
+
+	useTLS, err := tlsMode(*cert, *key, *insecure)
+	if err != nil {
+		log.Fatalf("wc3-mapd: %v", err)
+	}
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -42,15 +51,31 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 	log.Printf("wc3-mapd serving %s on %s (read-only)", *dir, *addr)
-	var err error
-	if *cert != "" && *key != "" {
+	if useTLS {
 		err = srv.ListenAndServeTLS(*cert, *key)
 	} else {
-		log.Print("warning: serving plain HTTP; pass -cert and -key to enable TLS")
+		log.Print("warning: serving plain HTTP (-insecure-http); launchers will not sync from this")
 		err = srv.ListenAndServe()
 	}
 	if err != nil {
 		log.Fatalf("wc3-mapd: %v", err)
+	}
+}
+
+// tlsMode decides how to serve. HTTPS needs both files. Plain HTTP has to be
+// asked for by name: the launcher trusts the manifest because of the pinned TLS
+// channel it arrives on, so a daemon that quietly fell back to HTTP when a
+// certificate path was missing would look up and serve nobody.
+func tlsMode(cert, key string, insecure bool) (useTLS bool, err error) {
+	switch {
+	case cert != "" && key != "":
+		return true, nil
+	case insecure && cert == "" && key == "":
+		return false, nil
+	case insecure:
+		return false, errors.New("-insecure-http was given together with a certificate or key; pick one")
+	default:
+		return false, errors.New("no TLS certificate: pass -cert and -key, or -insecure-http to serve plain HTTP on purpose")
 	}
 }
 
@@ -84,7 +109,14 @@ func handler(dir string) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		http.ServeFile(w, r, filepath.Join(dir, name))
+		// Regular files only, the same rule the manifest scan applies: a symlink
+		// in the library would be served through to whatever it points at.
+		path := filepath.Join(dir, name)
+		if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, path)
 	})
 
 	return mux
@@ -102,27 +134,28 @@ func readOnly(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // manifestCache serves the library manifest, recomputing it (which hashes every
-// map) only when the maps directory changes. Hashing a large library on every
-// request would pin CPU; a directory's mtime changes whenever a map is added or
-// removed, which for a curated library is the only time the manifest can change
-// (new or updated maps arrive under new names), so an mtime check is a cheap and
-// correct invalidation. The first request after a change does the scan under the
-// lock; concurrent requests wait and then serve the fresh cache.
+// map) only when the library changes. Hashing a large library on every request
+// would pin CPU, so each request only stats the files: the cache key is every
+// map's name, size and mtime. The directory's own mtime is not enough, because
+// it does not move when a file is rewritten in place, and the manifest would
+// then keep the old hash while the new bytes were served. The first request
+// after a change does the scan under the lock; concurrent requests wait and
+// then serve the fresh cache.
 type manifestCache struct {
 	dir string
 	mu  sync.Mutex
-	mod time.Time
+	key string
 	buf []byte
 }
 
 func (c *manifestCache) get() ([]byte, error) {
-	var mod time.Time
-	if fi, err := os.Stat(c.dir); err == nil {
-		mod = fi.ModTime()
+	key, err := libraryKey(c.dir)
+	if err != nil {
+		return nil, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.buf != nil && mod.Equal(c.mod) {
+	if c.buf != nil && key == c.key {
 		return c.buf, nil
 	}
 	m, err := maplib.ScanDir(c.dir)
@@ -133,6 +166,30 @@ func (c *manifestCache) get() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.buf, c.mod = b, mod
+	c.buf, c.key = b, key
 	return b, nil
+}
+
+// libraryKey fingerprints the library from directory metadata alone. A missing
+// directory is an empty library, as it is for ScanDir.
+func libraryKey(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "empty", nil
+		}
+		return "", err
+	}
+	h := sha256.New()
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue // gone between the listing and the stat
+		}
+		fmt.Fprintf(h, "%q %d %d\n", fi.Name(), fi.Size(), fi.ModTime().UnixNano())
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }

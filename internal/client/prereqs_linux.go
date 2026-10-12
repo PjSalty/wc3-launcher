@@ -598,10 +598,24 @@ func (d distro) gstreamerInstall(a wineArch) installPlan {
 	return installPlan{manual: true, note: "install the GStreamer codec plugins gst-libav + gst-plugins-good/bad/ugly, including the 32-bit variants Wine needs for a 32-bit game"}
 }
 
+// stdin is one buffered reader shared by every prompt. A fresh reader per prompt
+// reads ahead and throws the rest away, so an answer already typed for the next
+// question was lost and that question read as unanswered.
+var stdin = bufio.NewReader(os.Stdin)
+
 func promptYesNo(q string) bool {
 	fmt.Printf("%s [Y/n]: ", q)
-	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	return yesNo(stdin)
+}
+
+// yesNo reads one answer. Enter alone means yes, but only a real Enter: a closed
+// or empty stdin is nobody answering, and that must not approve a sudo install.
+func yesNo(in *bufio.Reader) bool {
+	line, err := in.ReadString('\n')
 	line = strings.ToLower(strings.TrimSpace(line))
+	if err != nil && line == "" {
+		return false
+	}
 	return line == "" || line == "y" || line == "yes"
 }
 

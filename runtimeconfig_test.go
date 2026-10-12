@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -119,5 +120,91 @@ func TestSeedPerUserConfig(t *testing.T) {
 	seedPerUserConfig()
 	if got := read(t, dir2); got.Token != "tok123" {
 		t.Fatalf("seed clobbered an existing config: token=%q, want tok123", got.Token)
+	}
+}
+
+// A new download ships a new wc3-launcher.json next to the binary. It won for
+// that run, but the per-user copy was only ever written once, so the desktop
+// shortcut (a copy of the binary with no file next to it) kept the old token and
+// pin after a rotation.
+func TestSeedFollowsARotatedShippedConfig(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for _, k := range []string{"WC3_SERVER", "WC3_RELAY_TOKEN", "WC3_RELAY_CERT_PIN", "WC3_GATEWAY"} {
+		t.Setenv(k, "")
+	}
+	origS, origT, origP, origG := serverHost, relayToken, relayCertPin, gatewayName
+	t.Cleanup(func() { serverHost, relayToken, relayCertPin, gatewayName = origS, origT, origP, origG })
+	stock := func() { serverHost, relayToken, relayCertPin, gatewayName = placeholderHost, "", "", "PvPGN" }
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shipped := filepath.Join(filepath.Dir(exe), "wc3-launcher.json")
+	ship := func(c fileConfig) {
+		t.Helper()
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(shipped, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { os.Remove(shipped) })
+
+	// The first download, run once from its folder.
+	ship(fileConfig{Server: "realm.example.net", Token: "old-token", CertPin: "old-pin"})
+	stock()
+	resolveConnection("", "", "", "")
+	seedPerUserConfig()
+
+	// The operator rotates the token and certificate and sends a new download.
+	ship(fileConfig{Server: "realm.example.net", Token: "new-token", CertPin: "new-pin"})
+	stock()
+	resolveConnection("", "", "", "")
+	seedPerUserConfig()
+
+	// The desktop shortcut: the same binary with nothing next to it.
+	if err := os.Remove(shipped); err != nil {
+		t.Fatal(err)
+	}
+	stock()
+	resolveConnection("", "", "", "")
+	if relayToken != "new-token" || relayCertPin != "new-pin" {
+		t.Fatalf("the shortcut resolved token=%q pin=%q, want the rotated values", relayToken, relayCertPin)
+	}
+
+	// With nothing shipped, a later run still leaves the player's file alone.
+	serverHost, relayToken = "elsewhere.example.org", "other"
+	seedPerUserConfig()
+	stock()
+	resolveConnection("", "", "", "")
+	if serverHost != "realm.example.net" || relayToken != "new-token" {
+		t.Fatalf("a run with no shipped file rewrote the saved config: server=%q token=%q", serverHost, relayToken)
+	}
+}
+
+func TestSaveFileConfigTightensAnExistingFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits are not meaningful on Windows")
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := saveFileConfig(fileConfig{Server: "realm.example.net", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := saveFileConfig(fileConfig{Server: "realm.example.net", Token: "t2"}); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config mode after a rewrite = %v, want 0600", got)
 	}
 }

@@ -5,6 +5,7 @@
 package client
 
 import (
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -132,14 +133,25 @@ func gatewayStrings(host, timezone, name string) []string {
 // ["1001", "<selected index>", host, zone, name, <default gateways>...]. It lets
 // an upgrading player be migrated off an older baked-in launcher without
 // re-entering their server. ok=false if it does not look like our value, or the
-// first host is a stock Blizzard gateway (nothing of ours to migrate).
+// first host is a stock Blizzard gateway or this machine (nothing to migrate).
+//
+// Loopback is what the launcher itself writes in relay mode, where WC3 talks to
+// the local gateway. Adopting it would save 127.0.0.1 as "the server" for good.
 func parseGateway(vals []string) (host, name string, ok bool) {
 	if len(vals) < 5 || vals[0] != "1001" {
 		return "", "", false
 	}
 	host, name = strings.TrimSpace(vals[2]), strings.TrimSpace(vals[4])
-	if host == "" || strings.HasSuffix(strings.ToLower(host), "battle.net") {
+	if host == "" || strings.HasSuffix(strings.ToLower(host), "battle.net") || isLoopbackHost(host) {
 		return "", "", false
 	}
 	return host, name, true
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

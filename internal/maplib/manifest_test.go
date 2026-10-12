@@ -18,6 +18,9 @@ func TestSafeName(t *testing.T) {
 		"a.w3x:evil.w3x", "C:foo.w3x", // colon: NTFS stream / drive-relative
 		"NUL.w3x", "con.w3x", "COM1.w3x", "LPT9.w3x", // Windows reserved device names
 		"a\x00.w3x", "tab\t.w3x", // control characters
+		"NUL .w3x", "COM\u00b9.w3x", "lpt\u00b3.w3x", "CONOUT$.w3x", "conin$.w3x", // device names Windows also honours
+		"a?.w3x", "a*.w3x", "a|b.w3x", `a"b.w3x`, "a<b>.w3x", // characters Windows forbids
+		"x\u202egpj.w3x", "x\u200b.w3x", "del\x7f.w3x", // bidi override, zero-width, DEL
 	}
 	for _, n := range bad {
 		if _, ok := SafeName(n); ok {
@@ -68,5 +71,29 @@ func write(t *testing.T, dir, name, data string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A symlink in the library was hashed and listed through to its target, so a
+// file outside the library could end up in the manifest.
+func TestScanDirListsRegularFilesOnly(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "real.w3x", "HM3Wreal")
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("HM3Wnot-in-the-library"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "link.w3x")); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "folder.w3x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m, err := ScanDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Maps) != 1 || m.Maps[0].Name != "real.w3x" {
+		t.Fatalf("scanned %+v, want only real.w3x", m.Maps)
 	}
 }

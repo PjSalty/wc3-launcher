@@ -13,7 +13,7 @@ import (
 // must drop ITSELF rather than freeze every other stream on the session.
 func TestRelayConnDeliverNeverBlocks(t *testing.T) {
 	stalled, _ := net.Pipe() // far end is never read, so writes block forever
-	rc := newRelayConn(stalled)
+	rc := newRelayConn(stalled, func(_ string, fn func()) { fn() })
 
 	done := make(chan struct{})
 	go func() {

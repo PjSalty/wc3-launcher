@@ -93,3 +93,98 @@ func TestHandler(t *testing.T) {
 		t.Errorf("POST status %d, want 405", resp.StatusCode)
 	}
 }
+
+// The cache was keyed on the directory's mtime, which does not move when a file
+// is rewritten in place: the manifest kept the old hash while the new bytes were
+// served, so every launcher rejected the download.
+func TestManifestCacheSeesAnInPlaceRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.w3x")
+	if err := os.WriteFile(path, []byte("HM3Wversion-1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := &manifestCache{dir: dir}
+	before, err := c.get()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("HM3Wversion-2"), 0o644); err != nil { // same length
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	// Put the directory's mtime back, as an in-place rewrite leaves it.
+	if err := os.Chtimes(dir, dirInfo.ModTime(), dirInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := c.get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) == string(before) {
+		t.Fatalf("manifest unchanged after the map was rewritten in place: %s", after)
+	}
+}
+
+func TestHandlerServesRegularFilesOnly(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("HM3Wnot-in-the-library"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "link.w3x")); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	srv := httptest.NewServer(handler(dir))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/maps/link.w3x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("a symlink out of the library was served with status %d, want 404", resp.StatusCode)
+	}
+	resp, err = http.Get(srv.URL + "/manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 4096)
+	n, _ := resp.Body.Read(buf)
+	if strings.Contains(string(buf[:n]), "link.w3x") {
+		t.Errorf("the manifest lists a symlink: %s", buf[:n])
+	}
+}
+
+func TestTLSMode(t *testing.T) {
+	cases := []struct {
+		cert, key string
+		insecure  bool
+		useTLS    bool
+		wantErr   bool
+	}{
+		{"c.pem", "k.pem", false, true, false},
+		{"", "", true, false, false},      // plain HTTP, asked for by name
+		{"", "", false, false, true},      // nothing given: refuse, do not fall back
+		{"c.pem", "", false, false, true}, // half a certificate
+		{"", "k.pem", false, false, true},
+		{"c.pem", "k.pem", true, true, false}, // a full certificate wins
+		{"c.pem", "", true, false, true},
+	}
+	for _, c := range cases {
+		got, err := tlsMode(c.cert, c.key, c.insecure)
+		if got != c.useTLS || (err != nil) != c.wantErr {
+			t.Errorf("tlsMode(%q, %q, %v) = %v, %v; want %v, err=%v", c.cert, c.key, c.insecure, got, err, c.useTLS, c.wantErr)
+		}
+	}
+}

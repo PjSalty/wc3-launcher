@@ -3,6 +3,7 @@
 package client
 
 import (
+	"bufio"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -252,5 +253,30 @@ func TestNewWoW64PlansAvoid32BitPackages(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A closed or empty stdin used to count as yes, which approved a sudo install
+// with nobody at the keyboard. And each prompt built its own reader, which read
+// ahead and discarded the answer already typed for the next question.
+func TestYesNo(t *testing.T) {
+	answer := func(input string) bool { return yesNo(bufio.NewReader(strings.NewReader(input))) }
+	for input, want := range map[string]bool{
+		"":      false, // nobody answered
+		"\n":    true,  // Enter takes the default
+		"y\n":   true,
+		"YES\n": true,
+		"n\n":   false,
+		"no\n":  false,
+		"y":     true, // an answer without the newline is still an answer
+	} {
+		if got := answer(input); got != want {
+			t.Errorf("yesNo(%q) = %v, want %v", input, got, want)
+		}
+	}
+
+	in := bufio.NewReader(strings.NewReader("n\ny\n"))
+	if first, second := yesNo(in), yesNo(in); first || !second {
+		t.Errorf("two answers read through one reader = %v, %v; want false, true", first, second)
 	}
 }

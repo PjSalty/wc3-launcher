@@ -120,6 +120,11 @@ func saveFileConfig(cfg fileConfig) (string, error) {
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		return "", err
 	}
+	// WriteFile applies the mode only when it creates the file, so one that
+	// already existed with wider permissions would keep them.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", err
+	}
 	return path, nil
 }
 
@@ -151,9 +156,14 @@ func isConfigured() bool {
 // re-prompt for a token the player does not have. The per-user file is read from
 // any location, closing that gap.
 //
-// It writes only when a real server is configured and no per-user config exists
-// yet, so it never clobbers a file the player already has, and a next-to-binary
-// wc3-launcher.json still wins while present (higher precedence in configPaths).
+// With no wc3-launcher.json next to the binary it writes only when no per-user
+// config exists yet, so it never clobbers a file the player already has.
+//
+// With one next to the binary, that file is the newer word: it is what a fresh
+// download ships, and it already wins for this run. It is mirrored into the
+// per-user config whenever the two differ. Otherwise a rotated token or cert pin
+// worked from the new folder and then failed from the desktop shortcut, which
+// kept reading the old per-user copy.
 func seedPerUserConfig() {
 	if !isConfigured() {
 		return
@@ -162,11 +172,42 @@ func seedPerUserConfig() {
 	if err != nil {
 		return
 	}
-	if _, err := os.Stat(path); err == nil {
+	saved, haveSaved := readFileConfig(path)
+	if shipped, ok := adjacentFileConfig(); ok && shipped.Server != "" {
+		if !haveSaved || saved != shipped {
+			// shortcut: best-effort; a write failure just means the next run retries.
+			_, _ = saveFileConfig(shipped)
+		}
+		return
+	}
+	if haveSaved {
 		return // already present: leave the player's file untouched
 	}
 	// shortcut: best-effort seed; a write failure just means the next run retries.
 	_, _ = saveFileConfig(fileConfig{Server: serverHost, Token: relayToken, CertPin: relayCertPin, Gateway: gatewayName})
+}
+
+// readFileConfig loads one config file. ok is false when it is absent or does not
+// parse (loadFileConfig is what warns about a malformed one).
+func readFileConfig(path string) (fileConfig, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fileConfig{}, false
+	}
+	var c fileConfig
+	if err := json.Unmarshal(b, &c); err != nil {
+		return fileConfig{}, false
+	}
+	return c, true
+}
+
+// adjacentFileConfig is the wc3-launcher.json next to the running binary, if any.
+func adjacentFileConfig() (fileConfig, bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		return fileConfig{}, false
+	}
+	return readFileConfig(filepath.Join(filepath.Dir(exe), "wc3-launcher.json"))
 }
 
 // mapsBaseURL is where the launcher syncs the curated map library from. It is

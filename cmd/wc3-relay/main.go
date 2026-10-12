@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -18,37 +19,60 @@ import (
 	"wc3-launcher/internal/relay"
 )
 
+// parseSwitch reads a 0/1 setting. Unset means def, so a protection stays on
+// unless it is turned off on purpose, and anything else is a typo, not a choice.
+func parseSwitch(name, v string, def bool) (bool, error) {
+	switch v {
+	case "":
+		return def, nil
+	case "1", "true":
+		return true, nil
+	case "0", "false":
+		return false, nil
+	}
+	return def, fmt.Errorf("%s=%q: want 0 or 1", name, v)
+}
+
 func main() {
+	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
+	authDefault, err := parseSwitch("RELAY_REQUIRE_AUTH", os.Getenv("RELAY_REQUIRE_AUTH"), true)
+	if err != nil {
+		logger.Fatalf("relay: %v", err)
+	}
+	tlsDefault, err := parseSwitch("RELAY_REQUIRE_TLS", os.Getenv("RELAY_REQUIRE_TLS"), true)
+	if err != nil {
+		logger.Fatalf("relay: %v", err)
+	}
+
 	listen := flag.String("listen", ":7000", "tunnel listen address for host launchers")
 	pvpgn := flag.String("pvpgn", "127.0.0.1:6112", "pvpgn bnet address to proxy host sessions to")
 	publicIP := flag.String("public-ip", "", "public IP advertised to joiners (informational in HELLO_ACK)")
 	poolLo := flag.Uint("pool-lo", 6200, "low end of the public game-port pool (must match the forwarded port range)")
 	poolHi := flag.Uint("pool-hi", 6299, "high end of the public game-port pool")
-	token := flag.String("token", os.Getenv("RELAY_TOKEN"), "shared tunnel token launchers must present (empty = accept any)")
-	requireAuth := flag.Bool("require-auth", os.Getenv("RELAY_REQUIRE_AUTH") == "1", "reject tunnels that do not present the token (default: grace mode, log only)")
+	token := flag.String("token", os.Getenv("RELAY_TOKEN"), "shared tunnel token launchers must present")
+	requireAuth := flag.Bool("require-auth", authDefault, "reject tunnels that do not present the token (RELAY_REQUIRE_AUTH=0 turns the gate off)")
 	tlsCert := flag.String("tls-cert", os.Getenv("RELAY_TLS_CERT"), "path to the TLS certificate (PEM) served on the tunnel port")
 	tlsKey := flag.String("tls-key", os.Getenv("RELAY_TLS_KEY"), "path to the TLS private key (PEM)")
-	requireTLS := flag.Bool("require-tls", os.Getenv("RELAY_REQUIRE_TLS") == "1", "reject plaintext tunnels, TLS only (default: also accept plain during rollout)")
+	requireTLS := flag.Bool("require-tls", tlsDefault, "reject plaintext tunnels, TLS only (RELAY_REQUIRE_TLS=0 also accepts plaintext)")
 	flag.Parse()
 
-	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
 	if *poolHi < *poolLo || *poolHi > 65535 {
 		logger.Fatalf("relay: invalid pool range %d-%d", *poolLo, *poolHi)
 	}
 
-	// Make the enforcement state impossible to misread. -require-auth with no
-	// token would reject every launcher (total self-inflicted outage), so refuse
-	// to start rather than take the whole realm down.
+	// Both gates are on unless turned off by name, so a deployment that forgets a
+	// setting fails to start instead of running open. The token gate with no token
+	// would reject every launcher, so that also refuses to start.
 	if *requireAuth && *token == "" {
-		logger.Fatalf("relay: -require-auth set but no -token/RELAY_TOKEN given; every launcher would be rejected")
+		logger.Fatalf("relay: no tunnel token: set -token/RELAY_TOKEN, or RELAY_REQUIRE_AUTH=0 to run without the token gate on purpose")
 	}
 	if *token == "" {
 		logger.Printf("relay: WARNING no tunnel token configured, the token gate is OFF (session caps + TLS still apply)")
 	} else if !*requireAuth {
-		logger.Printf("relay: WARNING token configured but -require-auth is off, so the token gate is NOT enforced (grace mode)")
+		logger.Printf("relay: WARNING token configured but the gate is off, so a wrong token is only logged")
 	}
 	if !*requireTLS {
-		logger.Printf("relay: WARNING -require-tls is off, plaintext tunnels are still accepted (rollout bridge)")
+		logger.Printf("relay: WARNING plaintext tunnels are accepted (RELAY_REQUIRE_TLS=0)")
 	}
 
 	var tlsConfig *tls.Config
@@ -63,7 +87,7 @@ func main() {
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
 		logger.Printf("relay: TLS enabled (require-tls=%v)", *requireTLS)
 	} else if *requireTLS {
-		logger.Fatalf("relay: -require-tls set but no -tls-cert/-tls-key provided")
+		logger.Fatalf("relay: no TLS certificate: set -tls-cert/-tls-key (RELAY_TLS_CERT/RELAY_TLS_KEY), or RELAY_REQUIRE_TLS=0 to accept plaintext on purpose")
 	}
 
 	srv := &relay.Server{

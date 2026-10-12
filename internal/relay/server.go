@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -105,7 +106,7 @@ func (srv *Server) ListenAndServe(ctx context.Context) error {
 			}
 			return fmt.Errorf("relay: accept: %w", err)
 		}
-		ip := hostOnly(conn.RemoteAddr())
+		ip := capKey(conn.RemoteAddr())
 		if !srv.admit(ip) {
 			srv.logf("tunnel from %s rejected: session cap reached", conn.RemoteAddr())
 			_ = conn.Close()
@@ -142,8 +143,8 @@ func (srv *Server) ListenAndServe(ctx context.Context) error {
 
 // wrapTLS peeks the first byte to tell a TLS handshake (0x16) from the plain
 // tunnel magic (0xF9). TLS connections are terminated here; a plaintext tunnel
-// is accepted only while RequireTLS is off (rollout bridge), and rejected once
-// it is on. Returns ok=false to reject the connection.
+// is accepted only while RequireTLS is off, and rejected once it is on. Returns
+// ok=false to reject the connection.
 func (srv *Server) wrapTLS(conn net.Conn) (net.Conn, bool) {
 	if srv.TLSConfig == nil {
 		return conn, true // TLS not configured yet; accept plain as before
@@ -180,10 +181,21 @@ func (p *prefixConn) Read(b []byte) (int, error) {
 	return p.Conn.Read(b)
 }
 
-// hostOnly strips the port from an addr so caps key on the source IP.
-func hostOnly(addr net.Addr) string {
-	if h, _, err := net.SplitHostPort(addr.String()); err == nil {
-		return h
+// capKey is what the per-source session cap counts by: the address for IPv4,
+// the /64 for IPv6. One IPv6 customer is handed a /64 or more, so keying on the
+// full address would let a single host walk the whole global cap from one prefix.
+func capKey(addr net.Addr) string {
+	ap, err := netip.ParseAddrPort(addr.String())
+	if err != nil {
+		return addr.String()
 	}
-	return addr.String()
+	a := ap.Addr().Unmap().WithZone("")
+	if a.Is4() {
+		return a.String()
+	}
+	pfx, err := a.Prefix(64)
+	if err != nil {
+		return a.String()
+	}
+	return pfx.String()
 }

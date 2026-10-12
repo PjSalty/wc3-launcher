@@ -11,7 +11,7 @@
 # cert+key at /tls, then run with -cert=/tls/fullchain.pem -key=/tls/privkey.pem.
 # There is no upload path: the container only ever reads /maps.
 
-FROM golang:1.25-bookworm AS build
+FROM golang:1.27-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -28,4 +28,4 @@ COPY --from=build /out/wc3-mapd /usr/local/bin/wc3-mapd
 EXPOSE 7443
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/wc3-mapd"]
-CMD ["-dir=/maps", "-addr=:7443"]
+CMD ["-dir=/maps", "-addr=:7443", "-cert=/tls/fullchain.pem", "-key=/tls/privkey.pem"]

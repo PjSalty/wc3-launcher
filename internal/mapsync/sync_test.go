@@ -3,6 +3,8 @@ package mapsync
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -11,10 +13,40 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"wc3-launcher/internal/maplib"
 )
+
+// tlsFor returns a client config that trusts srv's test certificate, standing in
+// for the pinned config the launcher passes.
+func tlsFor(srv *httptest.Server) *tls.Config {
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	return &tls.Config{RootCAs: pool}
+}
+
+func quiet() *log.Logger { return log.New(io.Discard, "", 0) }
+
+// library serves man and, for every listed name, body. hits counts requests.
+func library(man maplib.Manifest, body []byte, hits *atomic.Int32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits != nil {
+			hits.Add(1)
+		}
+		if r.URL.Path == "/manifest.json" {
+			_ = json.NewEncoder(w).Encode(man)
+			return
+		}
+		_, _ = w.Write(body)
+	})
+}
+
+func entryFor(name string, body []byte) maplib.Entry {
+	sum := sha256.Sum256(body)
+	return maplib.Entry{Name: name, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(body))}
+}
 
 func TestSyncAdditiveAndSafe(t *testing.T) {
 	good := []byte("HM3Wreal-map-bytes")
@@ -27,7 +59,7 @@ func TestSyncAdditiveAndSafe(t *testing.T) {
 		{Name: "bad.w3x", SHA256: goodSHA, Size: 5},                 // body will not match this hash
 		{Name: "../evil.w3x", SHA256: goodSHA, Size: 1},             // traversal name
 	}}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/manifest.json":
 			_ = json.NewEncoder(w).Encode(man)
@@ -50,7 +82,7 @@ func TestSyncAdditiveAndSafe(t *testing.T) {
 
 	logger := log.New(io.Discard, "", 0)
 	rep := &captureReporter{}
-	n, err := Sync(context.Background(), srv.URL, dir, nil, logger, rep)
+	n, err := Sync(context.Background(), srv.URL, dir, tlsFor(srv), logger, rep)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
@@ -89,7 +121,7 @@ func TestSyncAdditiveAndSafe(t *testing.T) {
 	}
 
 	// Re-sync is a no-op: everything present is left alone.
-	if n2, err := Sync(context.Background(), srv.URL, dir, nil, logger, nil); err != nil || n2 != 0 {
+	if n2, err := Sync(context.Background(), srv.URL, dir, tlsFor(srv), logger, nil); err != nil || n2 != 0 {
 		t.Errorf("re-sync added %d (err %v), want 0", n2, err)
 	}
 }
@@ -108,11 +140,126 @@ func (c *captureReporter) Update(done int, bytes int64, s string) { c.updates++ 
 func (c *captureReporter) Done(added int)                         { c.done = added }
 
 func TestSyncManifestError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	if _, err := Sync(context.Background(), srv.URL, t.TempDir(), nil, log.New(io.Discard, "", 0), nil); err == nil {
+	if _, err := Sync(context.Background(), srv.URL, t.TempDir(), tlsFor(srv), quiet(), nil); err == nil {
 		t.Error("expected an error when the manifest fetch fails")
+	}
+}
+
+// The manifest is trusted for the channel it arrives on. A plain http base URL
+// (WC3_MAPS_URL accepted one) has no such channel.
+func TestSyncRefusesAnythingButHTTPS(t *testing.T) {
+	body := []byte("HM3Wmap")
+	var hits atomic.Int32
+	srv := httptest.NewServer(library(maplib.Manifest{Maps: []maplib.Entry{entryFor("a.w3x", body)}}, body, &hits))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if _, err := Sync(context.Background(), srv.URL, dir, nil, quiet(), nil); err == nil {
+		t.Fatal("Sync accepted a plain http map server")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("Sync sent %d request(s) to a plain http map server", hits.Load())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.w3x")); !os.IsNotExist(err) {
+		t.Fatal("a map from a plain http server was written")
+	}
+}
+
+// A redirect used to be followed off the pinned channel: to plain http, to
+// another host, or to a service on the player's own machine.
+func TestSyncDoesNotFollowRedirects(t *testing.T) {
+	body := []byte("HM3Wmap")
+	var elsewhereHits atomic.Int32
+	elsewhere := httptest.NewServer(library(maplib.Manifest{Maps: []maplib.Entry{entryFor("a.w3x", body)}}, body, &elsewhereHits))
+	defer elsewhere.Close()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if _, err := Sync(context.Background(), srv.URL, dir, tlsFor(srv), quiet(), nil); err == nil {
+		t.Fatal("Sync succeeded through a redirect")
+	}
+	if elsewhereHits.Load() != 0 {
+		t.Fatalf("Sync followed the redirect: %d request(s) reached the other server", elsewhereHits.Load())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.w3x")); !os.IsNotExist(err) {
+		t.Fatal("a map fetched through a redirect was written")
+	}
+}
+
+// WC3 and Windows do not tell DotA.w3x from dota.w3x. On a case-sensitive disk
+// the second spelling was written next to the player's own map.
+func TestSyncTreatsNamesWithoutCase(t *testing.T) {
+	body := []byte("HM3Wserver-copy")
+	srv := httptest.NewTLSServer(library(maplib.Manifest{Maps: []maplib.Entry{
+		entryFor("dota.w3x", body), // the player has DotA.w3x
+		entryFor("New.w3x", body),
+		entryFor("NEW.W3X", body), // the same name again, later in the manifest
+	}}, body, nil))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	mine := []byte("HM3Wmy-own-edit")
+	if err := os.WriteFile(filepath.Join(dir, "DotA.w3x"), mine, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, err := Sync(context.Background(), srv.URL, dir, tlsFor(srv), quiet(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if n != 1 || len(names) != 2 {
+		t.Fatalf("added %d, folder now holds %v; want 1 added and exactly DotA.w3x plus New.w3x", n, names)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "DotA.w3x")); string(got) != string(mine) {
+		t.Fatal("the player's own map was replaced")
+	}
+}
+
+func TestSyncHoldsEntriesToTheirManifestValues(t *testing.T) {
+	body := []byte("HM3Wmap-bytes")
+	good := entryFor("good.w3x", body)
+	short := entryFor("short.w3x", body)
+	short.Size-- // the hash matches, the size does not
+	zero := entryFor("zero.w3x", body)
+	zero.Size = 0
+	negative := entryFor("negative.w3x", body)
+	negative.Size = -1 << 40 // would pull the byte budget below zero
+	huge := entryFor("huge.w3x", body)
+	huge.Size = maplib.MaxMapSize + 1
+	nohash := entryFor("nohash.w3x", body)
+	nohash.SHA256 = "not-a-hash"
+
+	srv := httptest.NewTLSServer(library(maplib.Manifest{Maps: []maplib.Entry{short, zero, negative, huge, nohash, good}}, body, nil))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	rep := &captureReporter{}
+	n, err := Sync(context.Background(), srv.URL, dir, tlsFor(srv), quiet(), rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("added %d, want only good.w3x", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "good.w3x")); err != nil {
+		t.Fatalf("good.w3x missing: %v", err)
+	}
+	// short.w3x is well-formed, so it is planned and then fails on download.
+	if want := good.Size + short.Size; rep.planMaps != 2 || rep.planBytes != want {
+		t.Fatalf("plan = %d maps / %d bytes, want 2 maps / %d bytes", rep.planMaps, rep.planBytes, want)
 	}
 }

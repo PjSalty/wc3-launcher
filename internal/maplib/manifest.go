@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Entry describes one map in the library.
@@ -50,17 +51,20 @@ func IsMapFile(name string) bool {
 // SafeName returns the bare filename if name is a plain map filename safe to
 // read from or write into a single directory, and false otherwise. It rejects
 // any path separator, any "..", a colon (drive-relative paths and NTFS alternate
-// data streams like "map.w3x:evil"), control characters, non-base paths, any
+// data streams like "map.w3x:evil"), the other characters Windows forbids in a
+// name, control and invisible formatting characters, non-base paths, any
 // non-map extension, and Windows reserved device names. Both the daemon
 // (serving) and the launcher (writing) run every name through this, so a hostile
 // manifest can neither escape the maps directory, attach a stream to an existing
 // file, nor drop a non-map file - on Linux or on the Windows launcher.
 func SafeName(name string) (string, bool) {
-	if name == "" || strings.ContainsAny(name, `/\:`) || strings.Contains(name, "..") {
+	if name == "" || strings.ContainsAny(name, `/\:<>"|?*`) || strings.Contains(name, "..") {
 		return "", false
 	}
 	for _, r := range name {
-		if r < 0x20 { // control characters, including NUL
+		// Control characters, and format characters such as the bidi overrides
+		// that make a name display as something it is not.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return "", false
 		}
 	}
@@ -72,13 +76,16 @@ func SafeName(name string) (string, bool) {
 	}
 	// Reject Windows reserved device names (CON, NUL, COM1, ...): reserved even
 	// with an extension (NUL.w3x still names the null device), and the launcher
-	// also runs on Windows.
+	// also runs on Windows. Windows also ignores spaces after the device name and
+	// reads the superscript digits as 1, 2 and 3, so "NUL .w3x" and "COM\u00b9.w3x"
+	// are the same devices.
 	stem := name
 	if i := strings.IndexByte(stem, '.'); i >= 0 {
 		stem = stem[:i]
 	}
+	stem = strings.NewReplacer("\u00b9", "1", "\u00b2", "2", "\u00b3", "3").Replace(strings.TrimRight(stem, " "))
 	switch strings.ToUpper(stem) {
-	case "CON", "PRN", "AUX", "NUL",
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
 		return "", false
@@ -127,7 +134,9 @@ func ScanDir(dir string) (Manifest, error) {
 	}
 	m := Manifest{Maps: []Entry{}}
 	for _, e := range entries {
-		if e.IsDir() {
+		// Regular files only. A symlink would be hashed and listed through to
+		// whatever it points at, including a file outside the library.
+		if !e.Type().IsRegular() {
 			continue
 		}
 		name, ok := SafeName(e.Name())
